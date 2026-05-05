@@ -168,11 +168,6 @@ def record_rw_metrics(acc, loss, inputs, outputs, targets, losses, weights):
 def log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss=None, rw_acc=None, split=None):
     log.debug(f"{split} Epoch [{epoch}] Loss {loss.avg:.4f} Prec@1 {top1.avg:.3f} Acc {acc.avg:.3f}"
               + (f" RwLoss {rw_loss.avg:.4f} RwAcc {rw_acc.avg:.3f}" if rw_loss else ""))
-    if not args.local_testing:
-        wandb.log({f"{split} loss": loss.avg, f"{split} prec1": top1.avg,
-                   f"{split} acc": acc.avg}, step=epoch)
-        if rw_loss and rw_acc:
-            wandb.log({f"{split} rw_loss": rw_loss.avg, f"{split} rw_acc": rw_acc.avg}, step=epoch)
 
 def adjust_learning_rate(optimizer, epoch):
     lr = args.lr
@@ -252,6 +247,12 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     batch_time = AverageMeter()
     acc = AverageMeter(); loss = AverageMeter(); top1 = AverageMeter()
     rw_acc = AverageMeter(); rw_loss = AverageMeter()
+    # extra meters for losses we want to track individually
+    total_m   = AverageMeter()   # total loss
+    nurd_m    = AverageMeter()   # NURD-weighted CE
+    con_m     = AverageMeter()   # contrastive
+    mi_m      = AverageMeter()   # MI / independence penalty
+    weight_m  = AverageMeter()   # mean NURD sample weight (tracks reweighting magnitude)
 
     model.train()
     end = time.time()
@@ -300,12 +301,14 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         acc, loss, top1 = record_metrics(acc, loss, top1, inputs, outputs, targets, losses_ce)
 
         # ── NURD joint independence penalty ───────────────────────────────────
+        info_loss_val = 0.0
         if joint_indep_args["joint_indep"]:
             _, _, info_losses = compute_critic_loss(
                 inputs, targets, nuisances, model,
                 joint_indep_args["critic_model"], joint_indep_args["critic_criterion"],
                 reweight_args, joint_indep_args, "train")
             losses_ce = losses_ce - joint_indep_args["lambda"] * info_losses
+            info_loss_val = info_losses.mean().item()
 
         # ── NURD exact reweighting ────────────────────────────────────────────
         weights = exact_weights.to(device) if reweight_args["reweight"] else torch.ones_like(exact_weights).to(device)
@@ -313,7 +316,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         loss_nurd = (losses_ce * weights).sum() / weights.sum()
 
         # ── Contrastive loss (on top of NURD weighted CE) ─────────────────────
-        embeddings  = model.get_embeddings(activations)            # [B, proj_dim]
+        embeddings  = model.get_embeddings(activations)
         loss_con    = contrastive_loss_fn(embeddings, targets)
         tensor_loss = (1 - args.contrast_weight) * loss_nurd + args.contrast_weight * loss_con
 
@@ -321,11 +324,32 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         tensor_loss.backward()
         optimizer.step()
 
+        bs = inputs.size(0)
         batch_time.update(time.time() - end); end = time.time()
+        total_m.update(tensor_loss.item(), bs)
+        nurd_m.update(loss_nurd.item(),   bs)
+        con_m.update(loss_con.item(),     bs)
+        mi_m.update(info_loss_val,        bs)
+        weight_m.update(weights.mean().item(), bs)
 
     log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss, rw_acc, split="Train")
+    current_lr = optimizer.param_groups[0]["lr"]
+    log.debug(f"  total={total_m.avg:.5f}  nurd={nurd_m.avg:.5f}  "
+              f"con={con_m.avg:.5f}  mi={mi_m.avg:.5f}  "
+              f"nurd_w_mean={weight_m.avg:.4f}  lr={current_lr:.2e}")
     if not args.local_testing:
-        wandb.log({"Train contrastive": loss_con.item()}, step=epoch)
+        wandb.log({
+            "Train/total_loss":       total_m.avg,
+            "Train/nurd_weighted_ce": nurd_m.avg,
+            "Train/contrastive":      con_m.avg,
+            "Train/mi_penalty":       mi_m.avg,
+            "Train/nurd_weight_mean": weight_m.avg,
+            "Train/rw_loss":          rw_loss.avg,
+            "Train/rw_acc":           rw_acc.avg,
+            "Train/acc":              acc.avg,
+            "Train/prec1":            top1.avg,
+            "LR":                     current_lr,
+        }, step=epoch)
 
 
 def validate(val_loader, model, criterion, epoch, log, reweight_args):
@@ -354,6 +378,14 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args):
             batch_time.update(time.time() - end); end = time.time()
 
     log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss, rw_acc, split="Val")
+    if not args.local_testing:
+        wandb.log({
+            "Val/loss":    loss.avg,
+            "Val/prec1":   top1.avg,
+            "Val/acc":     acc.avg,
+            "Val/rw_loss": rw_loss.avg,
+            "Val/rw_acc":  rw_acc.avg,
+        }, step=epoch)
     return_loss = rw_loss.avg if reweight_args["reweight"] else loss.avg
     return return_loss, acc.avg, rw_acc.avg
 
@@ -368,6 +400,8 @@ def main():
     sh = logging.StreamHandler()
     sh.setFormatter(logging.Formatter("%(asctime)s : %(message)s"))
     log.addHandler(fh); log.addHandler(sh)
+
+    args.in_dataset = "hlt"   # required by save_checkpoint path construction
 
     # ── Load pre-trained AE ────────────────────────────────────────────────
     ae_ckpt = torch.load(args.ae_ckpt, map_location=device)

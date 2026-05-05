@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+checkpoints/
+condor_logs/*.out
+condor_logs/*.err
+condor_logs/*.log
+wandb/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+.env
