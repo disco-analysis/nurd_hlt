@@ -1,0 +1,476 @@
+"""
+HLT NURD contrastive training.
+
+Built on top of gabhijith's train_exact.py; the NURD reweighting and
+joint-independence critic logic is kept verbatim.  What's added:
+
+  * HLTSmCocktailDataset  — PF candidate data; AE reco loss as nuisance z
+  * HLTContrastiveModel   — Roy's Linformer encoder + projector + classifier
+  * HLTCritic             — predicts nuisance bin from (latent, y)
+  * Contrastive loss      — SupCon / InfoNCE on top of NURD-weighted CE
+
+Usage
+-----
+python train_hlt.py \\
+    --data   /eos/user/e/escheull/smcocktail_1M_noZB/hlt_smcocktail_train.pt \\
+    --ae_ckpt <path/to/ae_checkpoint.pth> \\
+    [--reweight 1] [--joint_indep 1] [--critic_epochs 2] \\
+    [--epochs 100] [--batch_size 2048] [--lr 1e-4]
+"""
+import argparse
+import os
+import time
+import random
+import logging
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
+from torch.utils.data import DataLoader
+
+from models.hlt_autoencoder import HLTAutoencoder
+from models.hlt_con import HLTContrastiveModel, HLTCritic
+from dataset.hlt_smcocktail_dataset import build_hlt_datasets
+from utils import AverageMeter, save_checkpoint, accuracy
+
+# ── Contrastive losses ────────────────────────────────────────────────────────
+
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.05, base_temperature=0.05):
+        super().__init__()
+        self.T  = temperature
+        self.Tb = base_temperature
+
+    def forward(self, features, labels):
+        features = features.float()
+        if features.dim() < 3:
+            features = features.unsqueeze(1)
+        B = features.shape[0]
+        device = features.device
+
+        labels = labels.contiguous().view(-1, 1)
+        mask   = torch.eq(labels, labels.T).float().to(device)
+
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        anchor_dot       = torch.div(torch.matmul(contrast_feature, contrast_feature.T), self.T)
+        logits_max, _    = anchor_dot.max(dim=1, keepdim=True)
+        logits           = anchor_dot - logits_max.detach()
+
+        logits_mask = torch.scatter(
+            torch.ones_like(mask), 1,
+            torch.arange(B).view(-1,1).to(device), 0)
+        mask = mask * logits_mask
+
+        exp_logits  = torch.exp(logits) * logits_mask
+        log_prob    = logits - torch.log(exp_logits.sum(1, keepdim=True).clamp(min=1e-8))
+        n_pos       = mask.sum(1).clamp(min=1e-6)
+        mean_lp_pos = (mask * log_prob).sum(1) / n_pos
+        loss        = -(self.T / self.Tb) * mean_lp_pos
+        return loss.view(1, B).mean()
+
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+parser = argparse.ArgumentParser(description="HLT NURD contrastive training")
+# Data
+parser.add_argument("--data",       required=True,  type=str, help="Path to .pt training file")
+parser.add_argument("--ae_ckpt",    required=True,  type=str, help="Path to pre-trained AE checkpoint (.pth)")
+parser.add_argument("--val_split",  default=0.1,    type=float)
+parser.add_argument("--n_bins",     default=10,     type=int, help="Nuisance bins for AE reco loss")
+# Training
+parser.add_argument("--epochs",         default=100,    type=int)
+parser.add_argument("--reweight_epochs",default=0,      type=int)
+parser.add_argument("--critic_epochs",  default=2,      type=int)
+parser.add_argument("-b","--batch_size",default=2048,   type=int)
+parser.add_argument("--lr",             default=1e-4,   type=float)
+parser.add_argument("--weight_decay",   default=5e-3,   type=float)
+parser.add_argument("--cosine",         default=1,      type=int)
+parser.add_argument("--optimizer",      default="adam", type=str)
+parser.add_argument("--momentum",       default=0.9,    type=float)
+# NURD flags
+parser.add_argument("--reweight",       default=1,      type=int)
+parser.add_argument("--joint_indep",    default=1,      type=int)
+parser.add_argument("--_lambda",        default=1,      type=int)
+parser.add_argument("--marginal_indep", default=0,      type=int)
+parser.add_argument("--critic_restart", default=0,      type=int)
+parser.add_argument("--exact",          default=1,      type=int)
+# Contrastive loss
+parser.add_argument("--contrast_weight",default=0.05,   type=float)
+parser.add_argument("--contrast_temp",  default=0.05,   type=float)
+# Model architecture
+parser.add_argument("--embed_size",     default=128,    type=int)
+parser.add_argument("--latent_dim",     default=6,      type=int)
+parser.add_argument("--proj_dim",       default=6,      type=int)
+parser.add_argument("--num_heads",      default=8,      type=int)
+parser.add_argument("--num_layers",     default=4,      type=int)
+parser.add_argument("--dim_ff",         default=512,    type=int)
+parser.add_argument("--linear_dim",     default=16,     type=int)
+# Logging
+parser.add_argument("--exp_name",       default="hlt_nurd_run", type=str)
+parser.add_argument("--project_name",   default="hlt",          type=str)
+parser.add_argument("--log_name",       default="info.log",     type=str)
+parser.add_argument("--gpu_ids",        default="0",            type=str)
+parser.add_argument("--local_rank",     default=-1,             type=int)
+parser.add_argument("--manualSeed",     default=None,           type=int)
+parser.add_argument("--local_testing",  default=0,              type=int)
+parser.add_argument("--max_events",     default=-1,             type=int)
+args, unknown = parser.parse_known_args()
+print(f"Unknown args: {unknown}")
+
+if not args.local_testing:
+    import wandb
+    wandb.init(id=args.exp_name, resume="allow",
+               project="nurd-ood-" + args.project_name, reinit=True)
+    wandb.config.update(args)
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
+
+directory = f"checkpoints/hlt/{args.project_name}/{args.exp_name}/"
+os.makedirs(directory, exist_ok=True)
+
+os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def set_random_seed(seed):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+if args.manualSeed is None:
+    args.manualSeed = random.randint(1, 10000)
+set_random_seed(args.manualSeed)
+
+
+# ── Metric helpers (same as train_exact.py) ───────────────────────────────────
+
+def freeze_model(m):
+    for p in m.parameters(): p.requires_grad_(False)
+    return m
+
+def unfreeze_model(m):
+    for p in m.parameters(): p.requires_grad_(True)
+    return m
+
+def record_metrics(acc, loss, top1, inputs, outputs, targets, losses):
+    prec1 = accuracy(outputs.data, targets, topk=(1,))[0]
+    acc.update((torch.max(outputs,1)[1].data == targets).sum().data / len(outputs), inputs.size(0))
+    loss.update(losses.mean().data, inputs.size(0))
+    top1.update(prec1, inputs.size(0))
+    return acc, loss, top1
+
+def record_rw_metrics(acc, loss, inputs, outputs, targets, losses, weights):
+    num_correct = torch.max(outputs,1)[1].data == targets
+    acc.update((num_correct * weights).sum().data / weights.sum().data, inputs.size(0))
+    loss.update((losses * weights).sum().data / weights.sum().data, inputs.size(0))
+    return acc, loss
+
+def log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss=None, rw_acc=None, split=None):
+    log.debug(f"{split} Epoch [{epoch}] Loss {loss.avg:.4f} Prec@1 {top1.avg:.3f} Acc {acc.avg:.3f}"
+              + (f" RwLoss {rw_loss.avg:.4f} RwAcc {rw_acc.avg:.3f}" if rw_loss else ""))
+    if not args.local_testing:
+        wandb.log({f"{split} loss": loss.avg, f"{split} prec1": top1.avg,
+                   f"{split} acc": acc.avg}, step=epoch)
+        if rw_loss and rw_acc:
+            wandb.log({f"{split} rw_loss": rw_loss.avg, f"{split} rw_acc": rw_acc.avg}, step=epoch)
+
+def adjust_learning_rate(optimizer, epoch):
+    lr = args.lr
+    if args.cosine:
+        eta_min = lr * (0.1 ** 3)
+        lr = eta_min + (lr - eta_min) * (1 + math.cos(math.pi * epoch / args.epochs)) / 2
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr
+
+
+# ── Critic loss (identical to train_exact.py, just CrossEntropy for discrete z) ──
+
+def compute_critic_loss(inputs, labels, nuisances, model, critic_model,
+                        critic_criterion, reweight_args, joint_indep_args, split="train"):
+    activations, _ = model(inputs)
+    if joint_indep_args["marginal_indep"]:
+        y_in = torch.zeros_like(labels.unsqueeze(1)).float().to(device)
+    else:
+        y_in = labels.unsqueeze(1).float().to(device)
+    outputs = critic_model(activations, y_in)             # [B, n_bins]
+    losses  = critic_criterion(outputs, nuisances.long()) # [B]
+    nuisance_marginals = torch.tensor(
+        [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
+    ).to(device)
+    losses  = torch.div(losses, nuisance_marginals + 1e-8)
+    return outputs, nuisances, losses
+
+
+def train_critic(critic_model, model, train_loader, critic_criterion, critic_optimizer,
+                 epoch, log, reweight_args, joint_indep_args):
+    critic_model.train(); model.eval()
+    batch_time = AverageMeter()
+    rw_loss = AverageMeter(); rw_acc = AverageMeter()
+    end = time.time()
+    for inputs, targets, nuisances in train_loader:
+        exact_weights = torch.tensor([
+            reweight_args["train_dataset"].weights[(int(y.item()), int(z.item()))]
+            for y, z in zip(targets, nuisances)
+        ]).to(device)
+        inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
+        outputs, tgts, losses = compute_critic_loss(
+            inputs, targets, nuisances, model, critic_model,
+            critic_criterion, reweight_args, joint_indep_args, "train")
+        weights = exact_weights if reweight_args["reweight"] else torch.ones_like(exact_weights)
+        tensor_loss = (losses * weights).sum() / weights.sum()
+        critic_optimizer.zero_grad(); tensor_loss.backward(); critic_optimizer.step()
+        batch_time.update(time.time() - end); end = time.time()
+    log.debug(f"Train Critic Epoch [{epoch}]")
+    return critic_model
+
+
+def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, log,
+                    reweight_args, joint_indep_args):
+    critic_model.eval(); model.eval()
+    loss_m = AverageMeter(); rw_acc_m = AverageMeter(); acc_m = AverageMeter()
+    with torch.no_grad():
+        for inputs, targets, nuisances in val_loader:
+            exact_weights = torch.tensor([
+                reweight_args["val_dataset"].weights.get((int(y.item()), int(z.item())), 1.0)
+                for y, z in zip(targets, nuisances)
+            ]).to(device)
+            inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
+            outputs, tgts, losses = compute_critic_loss(
+                inputs, targets, nuisances, model, critic_model,
+                critic_criterion, reweight_args, joint_indep_args, "val")
+            weights = exact_weights if reweight_args["reweight"] else torch.ones_like(exact_weights)
+            loss_m.update((losses * weights).sum().item() / weights.sum().item(), inputs.size(0))
+    return loss_m.avg, acc_m.avg, rw_acc_m.avg
+
+
+# ── Main training function ────────────────────────────────────────────────────
+
+contrastive_loss_fn = SupConLoss(temperature=args.contrast_temp)
+
+def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
+          reweight_args, joint_indep_args):
+    batch_time = AverageMeter()
+    acc = AverageMeter(); loss = AverageMeter(); top1 = AverageMeter()
+    rw_acc = AverageMeter(); rw_loss = AverageMeter()
+
+    model.train()
+    end = time.time()
+    for inputs, targets, nuisances in train_loader:
+        exact_weights = torch.tensor([
+            reweight_args["train_dataset"].weights[(int(y.item()), int(z.item()))]
+            for y, z in zip(targets, nuisances)
+        ]).to(device)
+        inputs    = inputs.to(device)
+        targets   = targets.long().to(device)
+        nuisances = nuisances.to(device)
+
+        # ── joint independence: train critic inner loop ───────────────────────
+        if joint_indep_args["joint_indep"]:
+            best_loss = None
+            joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
+            model = freeze_model(model)
+            critic_optimizer = torch.optim.Adam(
+                joint_indep_args["critic_model"].parameters(),
+                lr=joint_indep_args["lr"], weight_decay=joint_indep_args["weight_decay"])
+            for ce in range(joint_indep_args["critic_epochs"]):
+                joint_indep_args["critic_model"] = train_critic(
+                    joint_indep_args["critic_model"], model, train_loader,
+                    joint_indep_args["critic_criterion"], critic_optimizer, ce, log,
+                    reweight_args, joint_indep_args)
+                c_loss, c_acc, c_rw_acc = validate_critic(
+                    val_loader, joint_indep_args["critic_model"], model,
+                    joint_indep_args["critic_criterion"], ce, log,
+                    reweight_args, joint_indep_args)
+                if best_loss is None or c_loss < best_loss:
+                    best_loss = c_loss
+                    save_checkpoint(args, {
+                        "epoch": ce+1,
+                        "state_dict_model": joint_indep_args["critic_model"].state_dict()
+                    }, ce+1, name="critic")
+            ckpt_file = f"checkpoints/hlt/{args.project_name}/{args.exp_name}/checkpoint_critic.pth.tar"
+            joint_indep_args["critic_model"].load_state_dict(
+                torch.load(ckpt_file)["state_dict_model"])
+            joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
+            model = unfreeze_model(model)
+
+        # ── forward pass ──────────────────────────────────────────────────────
+        activations, outputs = model(inputs)
+        losses_ce = criterion(outputs, targets)         # [B] CE loss
+
+        acc, loss, top1 = record_metrics(acc, loss, top1, inputs, outputs, targets, losses_ce)
+
+        # ── NURD joint independence penalty ───────────────────────────────────
+        if joint_indep_args["joint_indep"]:
+            _, _, info_losses = compute_critic_loss(
+                inputs, targets, nuisances, model,
+                joint_indep_args["critic_model"], joint_indep_args["critic_criterion"],
+                reweight_args, joint_indep_args, "train")
+            losses_ce = losses_ce - joint_indep_args["lambda"] * info_losses
+
+        # ── NURD exact reweighting ────────────────────────────────────────────
+        weights = exact_weights.to(device) if reweight_args["reweight"] else torch.ones_like(exact_weights).to(device)
+        rw_acc, rw_loss = record_rw_metrics(rw_acc, rw_loss, inputs, outputs, targets, losses_ce, weights)
+        loss_nurd = (losses_ce * weights).sum() / weights.sum()
+
+        # ── Contrastive loss (on top of NURD weighted CE) ─────────────────────
+        embeddings  = model.get_embeddings(activations)            # [B, proj_dim]
+        loss_con    = contrastive_loss_fn(embeddings, targets)
+        tensor_loss = (1 - args.contrast_weight) * loss_nurd + args.contrast_weight * loss_con
+
+        optimizer.zero_grad()
+        tensor_loss.backward()
+        optimizer.step()
+
+        batch_time.update(time.time() - end); end = time.time()
+
+    log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss, rw_acc, split="Train")
+    if not args.local_testing:
+        wandb.log({"Train contrastive": loss_con.item()}, step=epoch)
+
+
+def validate(val_loader, model, criterion, epoch, log, reweight_args):
+    batch_time = AverageMeter()
+    acc = AverageMeter(); loss = AverageMeter(); top1 = AverageMeter()
+    rw_acc = AverageMeter(); rw_loss = AverageMeter()
+
+    model.eval()
+    with torch.no_grad():
+        end = time.time()
+        for inputs, targets, nuisances in val_loader:
+            exact_weights = torch.tensor([
+                reweight_args["val_dataset"].weights.get((int(y.item()), int(z.item())), 1.0)
+                for y, z in zip(targets, nuisances)
+            ]).to(device)
+            inputs    = inputs.to(device)
+            targets   = targets.long().to(device)
+            _, outputs = model(inputs)
+            losses    = criterion(outputs, targets)
+
+            acc, loss, top1 = record_metrics(acc, loss, top1, inputs, outputs, targets, losses)
+            if reweight_args["reweight"]:
+                rw_acc, rw_loss = record_rw_metrics(
+                    rw_acc, rw_loss, inputs, outputs, targets, losses,
+                    exact_weights.to(device))
+            batch_time.update(time.time() - end); end = time.time()
+
+    log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss, rw_acc, split="Val")
+    return_loss = rw_loss.avg if reweight_args["reweight"] else loss.avg
+    return return_loss, acc.avg, rw_acc.avg
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    log = logging.getLogger(__name__)
+    log.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(os.path.join(directory, args.log_name), mode="w")
+    fh.setFormatter(logging.Formatter("%(asctime)s : %(message)s"))
+    sh = logging.StreamHandler()
+    sh.setFormatter(logging.Formatter("%(asctime)s : %(message)s"))
+    log.addHandler(fh); log.addHandler(sh)
+
+    # ── Load pre-trained AE ────────────────────────────────────────────────
+    ae_ckpt = torch.load(args.ae_ckpt, map_location=device)
+    ae_cfg  = ae_ckpt.get("ae_config", {
+        "features": None, "latent_dim": 16,
+        "encoder_config": {"nodes": [512,256]},
+        "decoder_config": {"nodes": [256,512, None]},
+        "alpha": 1.0
+    })
+    # if config didn't store features, infer from state dict
+    if ae_cfg["features"] is None:
+        first_w = ae_ckpt["ae"][next(iter(ae_ckpt["ae"]))]
+        ae_cfg["features"] = first_w.shape[1]
+
+    ae = HLTAutoencoder(ae_cfg).to(device)
+    ae.load_state_dict(ae_ckpt["ae"])
+    ae.eval()
+    for p in ae.parameters(): p.requires_grad_(False)
+    log.debug(f"Loaded frozen AE from {args.ae_ckpt}")
+
+    # ── Build datasets ─────────────────────────────────────────────────────
+    log.debug("Loading data and computing nuisance bins (AE reco)...")
+    train_dataset, val_dataset, obj_scaler = build_hlt_datasets(
+        args.data, ae, n_bins=args.n_bins,
+        val_split=args.val_split, max_events=args.max_events
+    )
+    log.debug(f"Train: {len(train_dataset)}  Val: {len(val_dataset)}")
+
+    num_classes = int(train_dataset.labels.max().item()) + 1
+    num_tokens  = train_dataset.features.size(1)
+
+    kwargs = {"pin_memory": False, "num_workers": 0, "drop_last": True}
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,  **kwargs)
+    val_loader   = DataLoader(val_dataset,   batch_size=args.batch_size, shuffle=False, **kwargs)
+
+    label_prior    = train_dataset.get_label_prior()
+    nuisance_prior = train_dataset.get_nuisance_prior() if args.joint_indep else None
+
+    # ── Build model ────────────────────────────────────────────────────────
+    model = HLTContrastiveModel(
+        num_classes=num_classes,
+        embed_size=args.embed_size,
+        latent_dim=args.latent_dim,
+        proj_dim=args.proj_dim,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        dim_ff=args.dim_ff,
+        linear_dim=args.linear_dim,
+        num_tokens=num_tokens,
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss(reduction="none").to(device)
+    if args.optimizer == "adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr,
+                                    weight_decay=args.weight_decay, momentum=args.momentum)
+
+    critic_model = HLTCritic(args.latent_dim, num_classes, args.n_bins).to(device) if args.joint_indep else None
+
+    reweight_args = {
+        "reweight":      args.reweight,
+        "label_prior":   label_prior,
+        "train_dataset": train_dataset,
+        "val_dataset":   val_dataset,
+    }
+    joint_indep_args = {
+        "joint_indep":      args.joint_indep,
+        "critic_model":     critic_model,
+        "lr":               args.lr,
+        "weight_decay":     args.weight_decay,
+        "critic_epochs":    args.critic_epochs,
+        "marginal_indep":   args.marginal_indep,
+        "lambda":           args._lambda,
+        "nuisance_prior":   nuisance_prior,
+        "critic_criterion": nn.CrossEntropyLoss(reduction="none").to(device),
+    }
+
+    cudnn.benchmark = True
+    best_loss = None
+    for epoch in range(args.epochs):
+        log.debug(f"Epoch {epoch}")
+        adjust_learning_rate(optimizer, epoch)
+        train(model, train_loader, val_loader, criterion, optimizer,
+              epoch + args.reweight_epochs, log, reweight_args, joint_indep_args)
+        val_loss, val_acc, val_rw_acc = validate(
+            val_loader, model, criterion, epoch + args.reweight_epochs, log, reweight_args)
+
+        if best_loss is None or val_loss < best_loss:
+            best_loss = val_loss
+            log.debug("Saving checkpoint")
+            save_checkpoint(args, {
+                "epoch": epoch + 1,
+                "state_dict_model": model.state_dict(),
+                "ae_scaler": obj_scaler,
+                "config": vars(args),
+            }, epoch + 1, name="main")
+            if not args.local_testing:
+                wandb.run.summary["best_val_rw_acc"] = val_rw_acc
+                wandb.run.summary["best_val_acc"]    = val_acc
+
+    log.debug(f"Done. Best val loss: {best_loss:.5f}")
+
+
+if __name__ == "__main__":
+    main()

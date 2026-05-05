@@ -1,0 +1,59 @@
+method: grid
+metric:
+  goal: maximize
+  name: Val rw_acc
+parameters:
+  # data
+  n_bins:
+    values: [10]
+  val_split:
+    values: [0.1]
+  # training
+  epochs:
+    values: [100]
+  critic_epochs:
+    values: [2]
+  batch_size:
+    values: [2048]
+  lr:
+    values: [0.0001]
+  weight_decay:
+    values: [0.005]
+  cosine:
+    values: [1]
+  optimizer:
+    values: [adam]
+  # NURD flags
+  reweight:
+    values: [1]
+  joint_indep:
+    values: [1]
+  _lambda:
+    values: [1]
+  # contrastive
+  contrast_weight:
+    values: [0.05]
+  contrast_temp:
+    values: [0.05]
+  # model architecture
+  embed_size:
+    values: [128]
+  latent_dim:
+    values: [6]
+  proj_dim:
+    values: [6]
+  num_heads:
+    values: [8]
+  num_layers:
+    values: [4]
+  dim_ff:
+    values: [512]
+  linear_dim:
+    values: [16]
+  # seeds
+  manualSeed:
+    values: [0, 1, 2]
+  project_name:
+    values: [hlt]
+program: train_hlt.py
+project: hlt_nurd_con
