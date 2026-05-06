@@ -179,3 +179,5 @@ for epoch in range(args.epochs):
             break
 
 log.debug(f"Done. Best val loss: {best_val:.6f}  checkpoint: {ckpt_path}")
+if not args.local_testing:
+    wandb.finish()

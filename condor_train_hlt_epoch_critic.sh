@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "==== HLT NURD contrastive training started: $(date) ===="
+echo "==== HLT NURD contrastive training (per-epoch critic) started: $(date) ===="
 echo "Host: $(hostname)"
 
 source /cvmfs/sft.cern.ch/lcg/views/LCG_106/x86_64-el9-gcc13-opt/setup.sh
@@ -28,14 +28,13 @@ fi
 
 export WANDB_API_KEY=$(cat ~/.wandb_api_key)
 
-# Path to pre-trained AE checkpoint (produced by condor_train_ae.sh)
 AE_CKPT="/eos/user/e/escheull/ssl_checkpoints/hlt/hlt/ae_pretrain/checkpoint_ae.pth"
 
 $PYTHON train_hlt.py \
     --data         /eos/user/e/escheull/smcocktail_1M_noZB/hlt_smcocktail_train.pt \
     --ae_ckpt      "$AE_CKPT" \
     --epochs       100 \
-    --batch_size   512 \
+    --batch_size   1024 \
     --lr           1e-4 \
     --weight_decay 5e-3 \
     --n_bins       10 \
@@ -51,9 +50,10 @@ $PYTHON train_hlt.py \
     --num_layers   4 \
     --dim_ff       512 \
     --linear_dim   16 \
+    --critic_schedule per_epoch \
     --_lambda      0.01 \
-    --exp_name     hlt_nurd_run_bs512 \
+    --exp_name     hlt_nurd_run_epoch_critic \
     --project_name hlt \
     --manualSeed   42
 
-echo "==== HLT NURD contrastive training finished: $(date) ===="
+echo "==== HLT NURD contrastive training (per-epoch critic) finished: $(date) ===="

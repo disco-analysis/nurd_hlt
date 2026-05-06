@@ -92,7 +92,7 @@ parser.add_argument("--momentum",       default=0.9,    type=float)
 # NURD flags
 parser.add_argument("--reweight",       default=1,      type=int)
 parser.add_argument("--joint_indep",    default=1,      type=int)
-parser.add_argument("--_lambda",        default=1,      type=int)
+parser.add_argument("--_lambda",        default=0.01,   type=float)
 parser.add_argument("--marginal_indep", default=0,      type=int)
 parser.add_argument("--critic_restart", default=0,      type=int)
 parser.add_argument("--exact",          default=1,      type=int)
@@ -116,14 +116,17 @@ parser.add_argument("--local_rank",     default=-1,             type=int)
 parser.add_argument("--manualSeed",     default=None,           type=int)
 parser.add_argument("--local_testing",  default=0,              type=int)
 parser.add_argument("--max_events",     default=-1,             type=int)
+parser.add_argument("--critic_schedule", default="per_batch",   type=str,
+                    help="'per_batch' (exact, trains critic on full dataset each batch) "
+                         "or 'per_epoch' (trains critic once per epoch)")
 args, unknown = parser.parse_known_args()
 print(f"Unknown args: {unknown}")
 
 if not args.local_testing:
     import wandb
-    wandb.init(id=args.exp_name, resume="allow",
+    wandb.init(name=args.exp_name,
                project="nurd-ood-" + args.project_name, reinit=True)
-    wandb.config.update(args)
+    wandb.config.update(args, allow_val_change=True)
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
@@ -265,8 +268,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         targets   = targets.long().to(device)
         nuisances = nuisances.to(device)
 
-        # ── joint independence: train critic inner loop ───────────────────────
-        if joint_indep_args["joint_indep"]:
+        # ── joint independence: train critic inner loop (per_batch schedule) ───
+        if joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "per_batch":
             best_loss = None
             joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
             model = freeze_model(model)
@@ -307,6 +310,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 inputs, targets, nuisances, model,
                 joint_indep_args["critic_model"], joint_indep_args["critic_criterion"],
                 reweight_args, joint_indep_args, "train")
+            info_losses = info_losses / (info_losses.detach().mean() + 1e-8)
             losses_ce = losses_ce - joint_indep_args["lambda"] * info_losses
             info_loss_val = info_losses.mean().item()
 
@@ -478,6 +482,7 @@ def main():
         "lambda":           args._lambda,
         "nuisance_prior":   nuisance_prior,
         "critic_criterion": nn.CrossEntropyLoss(reduction="none").to(device),
+        "critic_schedule":  args.critic_schedule,
     }
 
     cudnn.benchmark = True
@@ -485,6 +490,36 @@ def main():
     for epoch in range(args.epochs):
         log.debug(f"Epoch {epoch}")
         adjust_learning_rate(optimizer, epoch)
+
+        # ── per-epoch critic schedule: train critic once before main loop ─────
+        if args.joint_indep and args.critic_schedule == "per_epoch":
+            joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
+            model = freeze_model(model)
+            critic_optimizer = torch.optim.Adam(
+                joint_indep_args["critic_model"].parameters(),
+                lr=args.lr, weight_decay=args.weight_decay)
+            best_critic_loss = None
+            for ce in range(args.critic_epochs):
+                joint_indep_args["critic_model"] = train_critic(
+                    joint_indep_args["critic_model"], model, train_loader,
+                    joint_indep_args["critic_criterion"], critic_optimizer, ce, log,
+                    reweight_args, joint_indep_args)
+                c_loss, _, _ = validate_critic(
+                    val_loader, joint_indep_args["critic_model"], model,
+                    joint_indep_args["critic_criterion"], ce, log,
+                    reweight_args, joint_indep_args)
+                if best_critic_loss is None or c_loss < best_critic_loss:
+                    best_critic_loss = c_loss
+                    save_checkpoint(args, {
+                        "epoch": ce + 1,
+                        "state_dict_model": joint_indep_args["critic_model"].state_dict()
+                    }, ce + 1, name="critic")
+            ckpt_file = f"checkpoints/hlt/{args.project_name}/{args.exp_name}/checkpoint_critic.pth.tar"
+            joint_indep_args["critic_model"].load_state_dict(
+                torch.load(ckpt_file)["state_dict_model"])
+            joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
+            model = unfreeze_model(model)
+
         train(model, train_loader, val_loader, criterion, optimizer,
               epoch + args.reweight_epochs, log, reweight_args, joint_indep_args)
         val_loss, val_acc, val_rw_acc = validate(
@@ -504,6 +539,8 @@ def main():
                 wandb.run.summary["best_val_acc"]    = val_acc
 
     log.debug(f"Done. Best val loss: {best_loss:.5f}")
+    if not args.local_testing:
+        wandb.finish()
 
 
 if __name__ == "__main__":
