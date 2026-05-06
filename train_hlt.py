@@ -254,7 +254,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     total_m   = AverageMeter()   # total loss
     nurd_m    = AverageMeter()   # NURD-weighted CE
     con_m     = AverageMeter()   # contrastive
-    mi_m      = AverageMeter()   # MI / independence penalty
+    mi_m      = AverageMeter()   # MI / independence penalty (normalized, always ~1)
+    raw_mi_m  = AverageMeter()   # raw critic CE before normalization
     weight_m  = AverageMeter()   # mean NURD sample weight (tracks reweighting magnitude)
 
     model.train()
@@ -268,8 +269,32 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         targets   = targets.long().to(device)
         nuisances = nuisances.to(device)
 
+        # ── joint independence: one critic gradient step on this batch (interleaved) ─
+        if joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "interleaved":
+            joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
+            joint_indep_args["critic_model"].train()
+            model.eval()
+            with torch.no_grad():
+                act_detached, _ = model(inputs)
+            y_in = (torch.zeros_like(targets.unsqueeze(1)).float().to(device)
+                    if joint_indep_args["marginal_indep"]
+                    else targets.unsqueeze(1).float().to(device))
+            c_out    = joint_indep_args["critic_model"](act_detached, y_in)
+            c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
+            nu_marg  = torch.tensor(
+                [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
+            ).to(device)
+            c_losses = torch.div(c_losses, nu_marg + 1e-8)
+            w = exact_weights if reweight_args["reweight"] else torch.ones_like(exact_weights)
+            c_loss = (c_losses * w).sum() / w.sum()
+            joint_indep_args["critic_optimizer"].zero_grad()
+            c_loss.backward()
+            joint_indep_args["critic_optimizer"].step()
+            joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
+            model.train()
+
         # ── joint independence: train critic inner loop (per_batch schedule) ───
-        if joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "per_batch":
+        elif joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "per_batch":
             best_loss = None
             joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
             model = freeze_model(model)
@@ -305,11 +330,13 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
 
         # ── NURD joint independence penalty ───────────────────────────────────
         info_loss_val = 0.0
+        raw_mi_val = 0.0
         if joint_indep_args["joint_indep"]:
             _, _, info_losses = compute_critic_loss(
                 inputs, targets, nuisances, model,
                 joint_indep_args["critic_model"], joint_indep_args["critic_criterion"],
                 reweight_args, joint_indep_args, "train")
+            raw_mi_val = info_losses.mean().item()
             info_losses = info_losses / (info_losses.detach().mean() + 1e-8)
             losses_ce = losses_ce - joint_indep_args["lambda"] * info_losses
             info_loss_val = info_losses.mean().item()
@@ -334,12 +361,13 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         nurd_m.update(loss_nurd.item(),   bs)
         con_m.update(loss_con.item(),     bs)
         mi_m.update(info_loss_val,        bs)
+        raw_mi_m.update(raw_mi_val,       bs)
         weight_m.update(weights.mean().item(), bs)
 
     log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss, rw_acc, split="Train")
     current_lr = optimizer.param_groups[0]["lr"]
     log.debug(f"  total={total_m.avg:.5f}  nurd={nurd_m.avg:.5f}  "
-              f"con={con_m.avg:.5f}  mi={mi_m.avg:.5f}  "
+              f"con={con_m.avg:.5f}  mi={mi_m.avg:.5f}  raw_mi={raw_mi_m.avg:.5f}  "
               f"nurd_w_mean={weight_m.avg:.4f}  lr={current_lr:.2e}")
     if not args.local_testing:
         wandb.log({
@@ -347,6 +375,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             "Train/nurd_weighted_ce": nurd_m.avg,
             "Train/contrastive":      con_m.avg,
             "Train/mi_penalty":       mi_m.avg,
+            "Train/raw_mi_penalty":   raw_mi_m.avg,
             "Train/nurd_weight_mean": weight_m.avg,
             "Train/rw_loss":          rw_loss.avg,
             "Train/rw_acc":           rw_acc.avg,
@@ -483,6 +512,10 @@ def main():
         "nuisance_prior":   nuisance_prior,
         "critic_criterion": nn.CrossEntropyLoss(reduction="none").to(device),
         "critic_schedule":  args.critic_schedule,
+        "critic_optimizer": (torch.optim.Adam(critic_model.parameters(),
+                                              lr=args.lr, weight_decay=args.weight_decay)
+                             if args.joint_indep and args.critic_schedule == "interleaved"
+                             else None),
     }
 
     cudnn.benchmark = True
