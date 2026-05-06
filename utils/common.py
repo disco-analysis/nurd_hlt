@@ -52,15 +52,15 @@ def accuracy(output, target, topk=(1,)):
     return res
 
 
-def save_checkpoint(args, state, epoch, name = None):
+def save_checkpoint(args, state, epoch, name=None):
     """Saves checkpoint to disk"""
+    import datetime
     directory = "checkpoints/{in_dataset}/{name}/{exp}/".format(in_dataset=args.in_dataset, name=args.project_name, exp=args.exp_name)
     os.makedirs(directory, exist_ok=True)
-    # if name == None:
-    #     filename = directory + 'checkpoint_{}.pth.tar'.format(epoch)
-    # else: 
-    #     filename = directory + 'checkpoint_{}.pth.tar'.format(name)
     assert name is not None
-    filename = directory + 'checkpoint_{}.pth.tar'.format(name)
-    # filename = directory + 'checkpoint_{}_{}.pth.tar'.format(name, epoch)
+    if name == "main":
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = directory + f'checkpoint_main_{ts}.pth.tar'
+    else:
+        filename = directory + 'checkpoint_{}.pth.tar'.format(name)
     torch.save(state, filename)
