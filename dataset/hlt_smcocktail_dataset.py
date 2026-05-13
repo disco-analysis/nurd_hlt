@@ -15,18 +15,31 @@ from collections import Counter
 from sklearn.model_selection import train_test_split
 
 
-def _make_nurd_weights(labels, nuisances):
+def _make_nurd_weights(labels, nuisances, max_weight_ratio=10.0):
     """
-    Exact NURD weights: w(y,z) = 1/p(y,z), normalized.
-    Equivalent to p(y)*p(z)/p(y,z) up to a constant.
+    Exact NURD weights: w(y,z) = p(y)*p(z)/p(y,z) = n_y*n_z / (N*n_yz).
+    Under this weighting, y and z are marginally independent.
+    Normalized so that the per-sample mean weight equals 1, then clipped at
+    max_weight_ratio × mean to prevent extreme weights from destabilising training.
     """
-    group_counts = Counter()
-    for y, z in zip(labels.tolist(), nuisances.tolist()):
-        group_counts[(int(y), int(z))] += 1
-    total = len(labels)
-    weights_unnorm = {k: total / v for k, v in group_counts.items()}
-    total_w = sum(weights_unnorm.values())
-    return {k: v / total_w for k, v in weights_unnorm.items()}
+    N = len(labels)
+    labels_list    = [int(y) for y in labels.tolist()]
+    nuisances_list = [int(z) for z in nuisances.tolist()]
+
+    group_counts    = Counter(zip(labels_list, nuisances_list))
+    label_counts    = Counter(labels_list)
+    nuisance_counts = Counter(nuisances_list)
+
+    weights_raw = {
+        (y, z): (label_counts[y] * nuisance_counts[z]) / (N * n_yz)
+        for (y, z), n_yz in group_counts.items()
+    }
+    # normalize so E[w] = 1 over all training samples
+    mean_w = sum(weights_raw[k] * v for k, v in group_counts.items()) / N
+    weights_norm = {k: v / mean_w for k, v in weights_raw.items()}
+    # clip to max_weight_ratio × 1.0 (since mean is now 1) to reduce variance
+    cap = max_weight_ratio
+    return {k: min(v, cap) for k, v in weights_norm.items()}
 
 
 class HLTSmCocktailDataset(Dataset):
@@ -82,6 +95,12 @@ class HLTSmCocktailDataset(Dataset):
 
         # ── NURD exact weights ────────────────────────────────────────────────
         self.weights = _make_nurd_weights(labels[idx], nuisances_all[idx])
+        _w = list(self.weights.values())
+        import statistics
+        _w_mean = sum(_w) / len(_w)
+        _w_std  = statistics.stdev(_w)
+        print(f"[{split}] NURD weight groups={len(_w)}  mean={_w_mean:.3f}  "
+              f"std={_w_std:.3f}  min={min(_w):.3f}  max={max(_w):.3f}")
 
     def __len__(self):
         return len(self.features)

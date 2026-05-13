@@ -170,7 +170,7 @@ class HLTContrastiveModel(nn.Module):
             nn.Linear(proj_dim*4, proj_dim*4), nn.BatchNorm1d(proj_dim*4), nn.GELU(),
             nn.Linear(proj_dim*4, proj_dim),
         )
-        self.classifier = nn.Linear(proj_dim, num_classes)
+        self.classifier = nn.Linear(latent_dim, num_classes)
 
     def _make_mask(self, x):
         """Prepend a False (unpadded) slot for the CLS token."""
@@ -194,7 +194,7 @@ class HLTContrastiveModel(nn.Module):
 
         latent  = self.bottleneck(self.norm_cls(x[:, 0, :]))             # [B, latent_dim]
         emb     = F.normalize(self.projector(latent), dim=1)             # [B, proj_dim]
-        logits  = self.classifier(emb)                                   # [B, num_classes]
+        logits  = self.classifier(latent)                                # [B, num_classes]
         return latent, logits
 
     def get_embeddings(self, latent: torch.Tensor) -> torch.Tensor:
@@ -206,26 +206,34 @@ class HLTContrastiveModel(nn.Module):
 
 class HLTCritic(nn.Module):
     """
-    Predicts the nuisance bin from (latent, y).
-    Used by NURD's joint independence constraint.
-
-    Forward matches the MLPCritic interface:
-        critic(rx, y) -> logits [B, n_bins]
-    where rx = activations [B, latent_dim], y = labels [B, 1] float.
+    Two modes:
+      bin_pred    (default): predicts nuisance bin from (latent, y) — [B, n_bins]
+      density_ratio         : classifies real vs shuffled-z from (latent, y, z) — [B, 2]
+                              matches gabhijith's original density-ratio trick
     """
-    def __init__(self, latent_dim: int, num_classes: int, n_bins: int, hidden: int = 128):
+    def __init__(self, latent_dim: int, num_classes: int, n_bins: int,
+                 hidden: int = 128, critic_type: str = "bin_pred"):
         super().__init__()
-        self.label_embed = nn.Embedding(num_classes, 16)
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim + 16, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden),          nn.ReLU(),
-            nn.Linear(hidden, n_bins),
-        )
+        self.critic_type  = critic_type
+        self.label_embed  = nn.Embedding(num_classes, 16)
+        if critic_type == "density_ratio":
+            self.z_embed = nn.Embedding(n_bins, 8)
+            self.net = nn.Sequential(
+                nn.Linear(latent_dim + 16 + 8, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden),               nn.ReLU(),
+                nn.Linear(hidden, 2),                    # binary: real=1 / shuffled=0
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(latent_dim + 16, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden),          nn.ReLU(),
+                nn.Linear(hidden, n_bins),
+            )
 
-    def forward(self, rx: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        rx: [B, latent_dim]
-        y:  [B, 1] float labels (as produced by NURD's compute_critic_loss)
-        """
-        y_emb = self.label_embed(y.long().squeeze(1))      # [B, 16]
-        return self.net(torch.cat([rx, y_emb], dim=1))     # [B, n_bins]
+    def forward(self, rx: torch.Tensor, y: torch.Tensor,
+                z: torch.Tensor = None) -> torch.Tensor:
+        y_emb = self.label_embed(y.long().squeeze(1))          # [B, 16]
+        if self.critic_type == "density_ratio":
+            z_emb = self.z_embed(z.long())                     # [B, 8]
+            return self.net(torch.cat([rx, y_emb, z_emb], dim=1))
+        return self.net(torch.cat([rx, y_emb], dim=1))
