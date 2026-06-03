@@ -458,8 +458,11 @@ def ABCD(config):
                 lx, ly = lx[idx], ly[idx]
             kde = gaussian_kde(np.vstack([lx, ly]))
             zi  = kde(np.vstack([xi_global.flatten(), yi_global.flatten()]))
-            ax.contour(10**xi_global, 10**yi_global, zi.reshape(xi_global.shape),
-                       colors=color, alpha=0.7, linewidths=1.5)
+            zi_grid = zi.reshape(xi_global.shape)
+            # only draw contours in the bulk; suppress far-tail lines
+            levels = zi_grid.max() * np.array([0.05, 0.15, 0.4, 0.75])
+            ax.contour(10**xi_global, 10**yi_global, zi_grid,
+                       levels=levels, colors=color, alpha=0.7, linewidths=1.5)
             kde_legend_handles.append(Line2D([0], [0], color=color, linewidth=1.5, label=name))
 
         ax.set_xscale("log"); ax.set_yscale("log")
