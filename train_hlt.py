@@ -127,8 +127,16 @@ parser.add_argument("--critic_warmup_epochs", default=7,        type=int,
                     help="Epochs to train critic without applying penalty (let contrastive converge first)")
 parser.add_argument("--critic_ramp_epochs",   default=10,       type=int,
                     help="Epochs to cosine-ramp lambda from 0 to target after warmup")
-parser.add_argument("--critic_train_frac",    default=0.2,      type=float,
+parser.add_argument("--critic_train_frac",        default=0.2,   type=float,
                     help="Fraction of batches per epoch on which to do a critic gradient step")
+parser.add_argument("--critic_lr_multiplier",     default=10.0,  type=float,
+                    help="LR multiplier for the critic optimizer relative to main model LR")
+parser.add_argument("--n_critic_steps_per_batch", default=3,     type=int,
+                    help="Number of gradient steps to take on the critic per selected batch")
+parser.add_argument("--no_mi_norm",           action="store_true",
+                    help="Skip per-batch normalization of MI penalty (divide by batch mean). "
+                         "Without this, lambda is effectively rescaled by ~1/raw_mi, making "
+                         "different lambda values produce near-identical gradients.")
 args, unknown = parser.parse_known_args()
 print(f"Unknown args: {unknown}")
 
@@ -310,17 +318,20 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 y_in = (torch.zeros_like(targets.unsqueeze(1)).float().to(device)
                         if joint_indep_args["marginal_indep"]
                         else targets.unsqueeze(1).float().to(device))
-                c_out    = joint_indep_args["critic_model"](act_detached, y_in)
-                c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
-                nu_marg  = torch.tensor(
+                nu_marg = torch.tensor(
                     [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
                 ).to(device)
-                c_losses = torch.div(c_losses, nu_marg + 1e-8)
-                w = exact_weights if reweight_args["reweight"] else torch.ones_like(exact_weights)
-                c_loss = (c_losses * w).sum() / w.sum()
-                joint_indep_args["critic_optimizer"].zero_grad()
-                c_loss.backward()
-                joint_indep_args["critic_optimizer"].step()
+                # multiple steps on the same batch to help critic converge faster;
+                # critic is trained unweighted so it sees the natural latent-z correlation
+                n_steps = joint_indep_args.get("n_critic_steps_per_batch", 1)
+                for _ in range(n_steps):
+                    c_out    = joint_indep_args["critic_model"](act_detached, y_in)
+                    c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
+                    c_losses = torch.div(c_losses, nu_marg + 1e-8)
+                    c_loss   = c_losses.mean()
+                    joint_indep_args["critic_optimizer"].zero_grad()
+                    c_loss.backward()
+                    joint_indep_args["critic_optimizer"].step()
                 joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
                 model.train()
 
@@ -402,7 +413,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             else:
                 raw_mi_val = info_losses.mean().item()
                 if lam > 0.0:
-                    info_losses = info_losses / (info_losses.detach().mean() + 1e-8)
+                    if not args.no_mi_norm:
+                        info_losses = info_losses / (info_losses.detach().mean() + 1e-8)
                     losses_ce = losses_ce - lam * info_losses
                     info_loss_val = info_losses.mean().item()
 
@@ -587,9 +599,11 @@ def main():
         "critic_type":      args.critic_type,
         "critic_train_frac": args.critic_train_frac,
         "critic_optimizer": (torch.optim.Adam(critic_model.parameters(),
-                                              lr=args.lr, weight_decay=args.weight_decay)
+                                              lr=args.lr * args.critic_lr_multiplier,
+                                              weight_decay=args.weight_decay)
                              if args.joint_indep and args.critic_schedule in ("interleaved", "warmup")
                              else None),
+        "n_critic_steps_per_batch": args.n_critic_steps_per_batch,
     }
 
     cudnn.benchmark = True
