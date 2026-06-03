@@ -460,7 +460,7 @@ def ABCD(config):
             zi  = kde(np.vstack([xi_global.flatten(), yi_global.flatten()]))
             zi_grid = zi.reshape(xi_global.shape)
             # only draw contours in the bulk; suppress far-tail lines
-            levels = zi_grid.max() * np.array([0.05, 0.15, 0.4, 0.75])
+            levels = zi_grid.max() * np.array([0.05, 0.15, 0.3, 0.5, 0.7, 0.88])
             ax.contour(10**xi_global, 10**yi_global, zi_grid,
                        levels=levels, colors=color, alpha=0.7, linewidths=1.5)
             kde_legend_handles.append(Line2D([0], [0], color=color, linewidth=1.5, label=name))
