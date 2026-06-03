@@ -51,7 +51,7 @@ $PYTHON train_hlt.py \
     --critic_schedule          warmup \
     --critic_warmup_epochs     7 \
     --critic_ramp_epochs       10 \
-    --critic_train_frac        1.0 \
+    --critic_train_frac        0.2 \
     --critic_lr_multiplier     10.0 \
     --n_critic_steps_per_batch 3 \
     --_lambda      0.01 \
