@@ -91,6 +91,7 @@ class HLTSmCocktailDataset(Dataset):
         self.obj       = obj_data[idx]
         self.labels    = labels[idx].float()
         self.nuisances = nuisances_all[idx].float()
+        self.ae_reco   = ae_reco_all[idx].float()
         self.split     = split
 
         # ── NURD exact weights ────────────────────────────────────────────────
@@ -106,7 +107,7 @@ class HLTSmCocktailDataset(Dataset):
         return len(self.features)
 
     def __getitem__(self, idx):
-        return self.features[idx], self.labels[idx], self.nuisances[idx]
+        return self.features[idx], self.labels[idx], self.nuisances[idx], self.ae_reco[idx]
 
     def get_label_prior(self):
         total = len(self.labels)

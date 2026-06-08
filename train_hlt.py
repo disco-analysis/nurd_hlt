@@ -71,6 +71,62 @@ class SupConLoss(nn.Module):
         return loss.view(1, B).mean()
 
 
+# ── ABCD closure loss helpers (ported from double DisCo) ─────────────────────
+
+def _sigmoid_counts(var1, var2, cut1, cut2, weights, scale=50.0):
+    s1_high = torch.sigmoid(scale * (var1 - cut1))
+    s1_low  = torch.sigmoid(scale * (cut1 - var1))
+    s2_high = torch.sigmoid(scale * (var2 - cut2))
+    s2_low  = torch.sigmoid(scale * (cut2 - var2))
+    NA = torch.sum(s1_high * s2_high * weights)
+    NB = torch.sum(s1_high * s2_low  * weights)
+    NC = torch.sum(s1_low  * s2_high * weights)
+    ND = torch.sum(s1_low  * s2_low  * weights)
+    return NA, NB, NC, ND
+
+
+def closure_loss_batch(var1, var2, weights, n_cuts=15, n_events_min=10, max_tries=20, scale=50.0):
+    """ABCD closure |NA*ND - NB*NC| / (NA*ND + NB*NC) averaged over random cuts."""
+    v1 = var1.view(-1).float()
+    v2 = var2.view(-1).float()
+    w  = weights.view(-1).float()
+    with torch.no_grad():
+        x_min, x_max = torch.quantile(v1, 0.01).item(), torch.quantile(v1, 0.99).item()
+        y_min, y_max = torch.quantile(v2, 0.01).item(), torch.quantile(v2, 0.99).item()
+    v1_n = (v1 - x_min) / (x_max - x_min + 1e-8)
+    v2_n = (v2 - y_min) / (y_max - y_min + 1e-8)
+    losses = []
+    for _ in range(n_cuts):
+        for _ in range(max_tries):
+            with torch.no_grad():
+                c1 = np.random.uniform(0.0, 1.0)
+                c2 = np.random.uniform(0.0, 1.0)
+            NA, NB, NC, ND = _sigmoid_counts(v1_n, v2_n, c1, c2, w, scale=scale)
+            if all(v.item() > n_events_min for v in [NA, NB, NC, ND]):
+                break
+        else:
+            continue
+        losses.append(torch.abs(NA * ND - NB * NC) / (NA * ND + NB * NC + 1e-8))
+    if not losses:
+        return torch.tensor(0.0, device=var1.device)
+    return torch.stack(losses).mean()
+
+
+def _proxy_md(latent, qcd_mask):
+    """Batch-level squared Mahalanobis distance from QCD centroid (whitened PCA)."""
+    if qcd_mask.sum() < 2:
+        return torch.zeros(latent.size(0), device=latent.device)
+    with torch.no_grad():
+        bkg = latent[qcd_mask].detach().float()
+        mu  = bkg.mean(0)
+        centered = bkg - mu
+        cov = (centered.T @ centered) / bkg.shape[0]
+        L, V = torch.linalg.eigh(cov)
+        W = V / L.clamp(min=1e-6).sqrt()
+    z = (latent.float() - mu) @ W
+    return (z * z).sum(dim=1).to(latent.dtype)
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(description="HLT NURD contrastive training")
@@ -133,6 +189,10 @@ parser.add_argument("--critic_lr_multiplier",     default=10.0,  type=float,
                     help="LR multiplier for the critic optimizer relative to main model LR")
 parser.add_argument("--n_critic_steps_per_batch", default=3,     type=int,
                     help="Number of gradient steps to take on the critic per selected batch")
+parser.add_argument("--closure_weight",       default=0.0,   type=float,
+                    help="Weight on ABCD closure loss (0 = disabled). Uses batch-level MD as axis 2.")
+parser.add_argument("--qcd_label",            default=1,     type=int,
+                    help="Label index for QCD (used as reference class for MD and closure)")
 parser.add_argument("--no_mi_norm",           action="store_true",
                     help="Skip per-batch normalization of MI penalty (divide by batch mean). "
                          "Without this, lambda is effectively rescaled by ~1/raw_mi, making "
@@ -242,7 +302,7 @@ def train_critic(critic_model, model, train_loader, critic_criterion, critic_opt
     batch_time = AverageMeter()
     rw_loss = AverageMeter(); rw_acc = AverageMeter()
     end = time.time()
-    for inputs, targets, nuisances in train_loader:
+    for inputs, targets, nuisances, _ae_reco in train_loader:
         exact_weights = torch.tensor([
             reweight_args["train_dataset"].weights[(int(y.item()), int(z.item()))]
             for y, z in zip(targets, nuisances)
@@ -264,7 +324,7 @@ def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, lo
     critic_model.eval(); model.eval()
     loss_m = AverageMeter(); rw_acc_m = AverageMeter(); acc_m = AverageMeter()
     with torch.no_grad():
-        for inputs, targets, nuisances in val_loader:
+        for inputs, targets, nuisances, _ae_reco in val_loader:
             exact_weights = torch.tensor([
                 reweight_args["val_dataset"].weights.get((int(y.item()), int(z.item())), 1.0)
                 for y, z in zip(targets, nuisances)
@@ -291,6 +351,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     total_m   = AverageMeter()   # total loss
     nurd_m    = AverageMeter()   # NURD-weighted CE
     con_m     = AverageMeter()   # contrastive
+    closure_m  = AverageMeter()   # ABCD closure
     mi_m       = AverageMeter()   # MI / independence penalty (normalized, always ~1)
     raw_mi_m   = AverageMeter()   # raw critic CE before normalization
     weight_cv_m = AverageMeter()  # coeff. of variation of NURD weights (std/mean); 0 = uniform, >1 = heavy tails
@@ -298,7 +359,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
 
     model.train()
     end = time.time()
-    for inputs, targets, nuisances in train_loader:
+    for inputs, targets, nuisances, ae_reco in train_loader:
         exact_weights = torch.tensor([
             reweight_args["train_dataset"].weights[(int(y.item()), int(z.item()))]
             for y, z in zip(targets, nuisances)
@@ -306,6 +367,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         inputs    = inputs.to(device)
         targets   = targets.long().to(device)
         nuisances = nuisances.to(device)
+        ae_reco   = ae_reco.to(device)
 
         # ── joint independence: warmup schedule — interleaved critic on critic_train_frac of batches ─
         if joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "warmup":
@@ -428,6 +490,20 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         loss_con    = contrastive_loss_fn(embeddings, targets)
         tensor_loss = (1 - args.contrast_weight) * loss_nurd + args.contrast_weight * loss_con
 
+        # ── ABCD closure loss (optional, batch-level MD) ───────────────────────
+        loss_closure = torch.tensor(0.0, device=device)
+        if args.closure_weight > 0.0:
+            qcd_mask = targets == args.qcd_label
+            if qcd_mask.sum() > 10:
+                proxy_md = _proxy_md(activations, qcd_mask)
+                nw = torch.ones(qcd_mask.sum(), device=device)
+                loss_closure = closure_loss_batch(
+                    ae_reco[qcd_mask].float(),
+                    proxy_md[qcd_mask].float(),
+                    nw,
+                )
+                tensor_loss = tensor_loss + args.closure_weight * loss_closure
+
         optimizer.zero_grad()
         tensor_loss.backward()
         optimizer.step()
@@ -440,6 +516,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         total_m.update(tensor_loss.item(),      bs)
         nurd_m.update(loss_nurd.item(),         bs)
         con_m.update(loss_con.item(),           bs)
+        closure_m.update(loss_closure.item(),   bs)
         mi_m.update(info_loss_val,              bs)
         raw_mi_m.update(raw_mi_val,             bs)
         weight_cv_m.update((w_std / (w_mean + 1e-8)).item(), bs)
@@ -448,13 +525,15 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss, rw_acc, split="Train")
     current_lr = optimizer.param_groups[0]["lr"]
     log.debug(f"  total={total_m.avg:.5f}  nurd={nurd_m.avg:.5f}  "
-              f"con={con_m.avg:.5f}  mi={mi_m.avg:.5f}  raw_mi={raw_mi_m.avg:.5f}  "
+              f"con={con_m.avg:.5f}  closure={closure_m.avg:.5f}  "
+              f"mi={mi_m.avg:.5f}  raw_mi={raw_mi_m.avg:.5f}  "
               f"w_cv={weight_cv_m.avg:.3f}  w_ess={weight_ess_m.avg:.3f}  lr={current_lr:.2e}")
     if not args.local_testing:
         wandb.log({
             "Train/total_loss":       total_m.avg,
             "Train/nurd_weighted_ce": nurd_m.avg,
             "Train/contrastive":      con_m.avg,
+            "Train/closure":          closure_m.avg,
             "Train/mi_penalty":       mi_m.avg,
             "Train/raw_mi_penalty":   raw_mi_m.avg,
             "Train/nurd_weight_cv":   weight_cv_m.avg,
@@ -476,7 +555,7 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args):
     model.eval()
     with torch.no_grad():
         end = time.time()
-        for inputs, targets, nuisances in val_loader:
+        for inputs, targets, nuisances, _ae_reco in val_loader:
             exact_weights = torch.tensor([
                 reweight_args["val_dataset"].weights.get((int(y.item()), int(z.item())), 1.0)
                 for y, z in zip(targets, nuisances)
