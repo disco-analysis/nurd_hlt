@@ -49,7 +49,7 @@ if not args.local_testing:
     import wandb
     wandb.init(id=args.exp_name, resume="allow",
                project="nurd-ood-" + args.project_name, reinit=True)
-    wandb.config.update(args)
+    wandb.config.update(args, allow_val_change=True)
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
