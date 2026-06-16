@@ -37,9 +37,26 @@ spec:
 
               cd /axovol/contrastive_axis/hlt_nurd_con
 
+              DATA=/axovol/contrastive_axis/data/hlt_smcocktail_train.pt
+              AE_CKPT=checkpoints/hlt/hlt/ae_pretrain/checkpoint_ae.pth
+
+              echo "=== Step 1: AE pretraining: $(date) ==="
+              python train_ae.py \
+                --data         $DATA \
+                --epochs       100 \
+                --batch_size   4096 \
+                --lr           1e-3 \
+                --latent_dim   16 \
+                --enc_nodes    512 256 \
+                --dec_nodes    256 512 \
+                --exp_name     ae_pretrain \
+                --project_name hlt
+              echo "=== AE pretraining done: $(date) ==="
+
+              echo "=== Step 2: NURD closure training: $(date) ==="
               python train_hlt.py \
-                --data         /axovol/contrastive_axis/data/hlt_smcocktail_train.pt \
-                --ae_ckpt      /axovol/contrastive_axis/checkpoints/checkpoint_ae.pth \
+                --data         $DATA \
+                --ae_ckpt      $AE_CKPT \
                 --epochs       100 \
                 --batch_size   4096 \
                 --lr           1e-4 \
@@ -70,7 +87,7 @@ spec:
                 --project_name hlt \
                 --manualSeed   42
 
-              echo "=== Job finished: $(date) ==="
+              echo "=== NURD closure training done: $(date) ==="
           env:
             - name: WANDB_API_KEY
               valueFrom:
