@@ -112,19 +112,47 @@ def closure_loss_batch(var1, var2, weights, n_cuts=15, n_events_min=10, max_trie
     return torch.stack(losses).mean()
 
 
-def _proxy_md(latent, qcd_mask):
-    """Batch-level squared Mahalanobis distance from QCD centroid (whitened PCA)."""
-    if qcd_mask.sum() < 2:
-        return torch.zeros(latent.size(0), device=latent.device)
+def fit_qcd_pca(model, train_loader, device, qcd_label):
+    """Fit whitened PCA on all training QCD activations (epoch-level, stable covariance estimate)."""
+    model.eval()
+    all_bkg = []
     with torch.no_grad():
-        bkg = latent[qcd_mask].detach().float()
-        mu  = bkg.mean(0)
-        centered = bkg - mu
-        cov = (centered.T @ centered) / bkg.shape[0]
-        L, V = torch.linalg.eigh(cov)
-        W = V / L.clamp(min=1e-6).sqrt()
-    z = (latent.float() - mu) @ W
+        for inputs, targets, _, _ae in train_loader:
+            inputs  = inputs.to(device)
+            targets = targets.to(device)
+            latent, _ = model(inputs)
+            mask = targets == qcd_label
+            if mask.sum() > 0:
+                all_bkg.append(latent[mask].float().cpu())
+    model.train()
+    bkg = torch.cat(all_bkg, dim=0)
+    mu  = bkg.mean(0)
+    centered = bkg - mu
+    cov = (centered.T @ centered) / bkg.shape[0]
+    L, V = torch.linalg.eigh(cov)
+    W = V / L.clamp(min=1e-6).sqrt()
+    return mu.to(device), W.to(device)
+
+
+def _proxy_md(latent, pca_mu, pca_W):
+    """Squared Mahalanobis distance from QCD centroid using epoch-level whitened PCA."""
+    z = (latent.float() - pca_mu) @ pca_W
     return (z * z).sum(dim=1).to(latent.dtype)
+
+
+def _proxy_md_batch(latent, qcd_mask):
+    """Per-batch Mahalanobis distance using covariance estimated from QCD events in this batch.
+    Mirrors the double disco approach: always reflects the current latent geometry."""
+    vec = latent.float()
+    with torch.no_grad():
+        mu = vec[qcd_mask].detach().mean(0)
+    centered = vec - mu
+    with torch.no_grad():
+        centered_bkg = centered[qcd_mask].detach()
+        cov = (centered_bkg.T @ centered_bkg) / centered_bkg.shape[0]
+        D = cov.shape[0]
+        precision = torch.linalg.inv(cov + 1e-6 * torch.eye(D, device=cov.device, dtype=cov.dtype))
+    return torch.sum((centered @ precision) * centered, dim=1).to(latent.dtype)
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -148,7 +176,7 @@ parser.add_argument("--momentum",       default=0.9,    type=float)
 # NURD flags
 parser.add_argument("--reweight",       default=1,      type=int)
 parser.add_argument("--joint_indep",    default=1,      type=int)
-parser.add_argument("--_lambda",        default=0.01,   type=float)
+parser.add_argument("--_lambda",        default=0.1,    type=float)
 parser.add_argument("--marginal_indep", default=0,      type=int)
 parser.add_argument("--critic_restart", default=0,      type=int)
 parser.add_argument("--exact",          default=1,      type=int)
@@ -172,12 +200,14 @@ parser.add_argument("--local_rank",     default=-1,             type=int)
 parser.add_argument("--manualSeed",     default=None,           type=int)
 parser.add_argument("--local_testing",  default=0,              type=int)
 parser.add_argument("--max_events",     default=-1,             type=int)
-parser.add_argument("--critic_schedule", default="per_batch",   type=str,
-                    help="'per_batch' (exact, trains critic on full dataset each batch) "
+parser.add_argument("--critic_schedule", default="warmup",      type=str,
+                    help="'warmup' (interleaved critic with warmup+ramp, recommended) "
+                         "'interleaved' (one critic step per batch) "
+                         "'per_batch' (trains critic on full dataset each batch, slow) "
                          "or 'per_epoch' (trains critic once per epoch)")
-parser.add_argument("--critic_type",    default="bin_pred",     type=str,
-                    help="'bin_pred' (predict nuisance bin, our default) "
-                         "or 'density_ratio' (gabhijith's shuffled-z binary classification)")
+parser.add_argument("--critic_type",    default="density_ratio", type=str,
+                    help="'density_ratio' (shuffled-z binary classification, matches paper) "
+                         "or 'bin_pred' (predict nuisance bin)")
 # Warmup critic schedule parameters (used when --critic_schedule warmup)
 parser.add_argument("--critic_warmup_epochs", default=7,        type=int,
                     help="Epochs to train critic without applying penalty (let contrastive converge first)")
@@ -191,12 +221,18 @@ parser.add_argument("--n_critic_steps_per_batch", default=3,     type=int,
                     help="Number of gradient steps to take on the critic per selected batch")
 parser.add_argument("--closure_weight",       default=0.0,   type=float,
                     help="Weight on ABCD closure loss (0 = disabled). Uses batch-level MD as axis 2.")
+parser.add_argument("--closure_n_cuts",       default=15,    type=int,
+                    help="Number of random ABCD cut pairs per batch (more = lower variance gradient).")
+parser.add_argument("--closure_sigmoid_scale", default=50.0,  type=float,
+                    help="Sigmoid sharpness for ABCD counts (lower = more events contribute gradient).")
 parser.add_argument("--qcd_label",            default=1,     type=int,
                     help="Label index for QCD (used as reference class for MD and closure)")
-parser.add_argument("--no_mi_norm",           action="store_true",
-                    help="Skip per-batch normalization of MI penalty (divide by batch mean). "
-                         "Without this, lambda is effectively rescaled by ~1/raw_mi, making "
-                         "different lambda values produce near-identical gradients.")
+parser.add_argument("--mi_norm",              action="store_true",
+                    help="Enable per-batch normalization of MI penalty (divide by batch mean). "
+                         "This rescales lambda by ~1/raw_mi, making different lambda values "
+                         "produce near-identical gradients — usually harmful. Off by default.")
+# backwards-compat alias so old --no_mi_norm flags still work
+parser.add_argument("--no_mi_norm",           action="store_true", help=argparse.SUPPRESS)
 args, unknown = parser.parse_known_args()
 print(f"Unknown args: {unknown}")
 
@@ -268,8 +304,12 @@ def get_effective_lambda(epoch):
 
 
 def compute_critic_loss(inputs, labels, nuisances, model, critic_model,
-                        critic_criterion, reweight_args, joint_indep_args, split="train"):
-    activations, _ = model(inputs)
+                        critic_criterion, reweight_args, joint_indep_args, split="train",
+                        precomputed_activations=None):
+    if precomputed_activations is not None:
+        activations = precomputed_activations
+    else:
+        activations, _ = model(inputs)
     y_in = (torch.zeros_like(labels.unsqueeze(1)).float().to(device)
             if joint_indep_args["marginal_indep"]
             else labels.unsqueeze(1).float().to(device))
@@ -343,7 +383,7 @@ def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, lo
 contrastive_loss_fn = SupConLoss(temperature=args.contrast_temp)
 
 def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
-          reweight_args, joint_indep_args, effective_lambda=None):
+          reweight_args, joint_indep_args, effective_lambda=None, pca_mu=None, pca_W=None):
     batch_time = AverageMeter()
     acc = AverageMeter(); loss = AverageMeter(); top1 = AverageMeter()
     rw_acc = AverageMeter(); rw_loss = AverageMeter()
@@ -387,10 +427,17 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 # critic is trained unweighted so it sees the natural latent-z correlation
                 n_steps = joint_indep_args.get("n_critic_steps_per_batch", 1)
                 for _ in range(n_steps):
-                    c_out    = joint_indep_args["critic_model"](act_detached, y_in)
-                    c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
-                    c_losses = torch.div(c_losses, nu_marg + 1e-8)
-                    c_loss   = c_losses.mean()
+                    if joint_indep_args.get("critic_type") == "density_ratio":
+                        shuffled_z = nuisances[torch.randperm(nuisances.size(0))]
+                        pos_out    = joint_indep_args["critic_model"](act_detached, y_in, nuisances)
+                        neg_out    = joint_indep_args["critic_model"](act_detached, y_in, shuffled_z)
+                        c_loss     = (joint_indep_args["critic_criterion"](pos_out, torch.ones(len(nuisances), dtype=torch.long, device=device)).mean()
+                                    + joint_indep_args["critic_criterion"](neg_out, torch.zeros(len(nuisances), dtype=torch.long, device=device)).mean()) / 2
+                    else:
+                        c_out    = joint_indep_args["critic_model"](act_detached, y_in)
+                        c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
+                        c_losses = torch.div(c_losses, nu_marg + 1e-8)
+                        c_loss   = c_losses.mean()
                     joint_indep_args["critic_optimizer"].zero_grad()
                     c_loss.backward()
                     joint_indep_args["critic_optimizer"].step()
@@ -407,14 +454,21 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             y_in = (torch.zeros_like(targets.unsqueeze(1)).float().to(device)
                     if joint_indep_args["marginal_indep"]
                     else targets.unsqueeze(1).float().to(device))
-            c_out    = joint_indep_args["critic_model"](act_detached, y_in)
-            c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
-            nu_marg  = torch.tensor(
-                [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
-            ).to(device)
-            c_losses = torch.div(c_losses, nu_marg + 1e-8)
-            w = exact_weights if reweight_args["reweight"] else torch.ones_like(exact_weights)
-            c_loss = (c_losses * w).sum() / w.sum()
+            if joint_indep_args.get("critic_type") == "density_ratio":
+                shuffled_z = nuisances[torch.randperm(nuisances.size(0))]
+                pos_out    = joint_indep_args["critic_model"](act_detached, y_in, nuisances)
+                neg_out    = joint_indep_args["critic_model"](act_detached, y_in, shuffled_z)
+                c_loss     = (joint_indep_args["critic_criterion"](pos_out, torch.ones(len(nuisances), dtype=torch.long, device=device)).mean()
+                            + joint_indep_args["critic_criterion"](neg_out, torch.zeros(len(nuisances), dtype=torch.long, device=device)).mean()) / 2
+            else:
+                c_out    = joint_indep_args["critic_model"](act_detached, y_in)
+                c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
+                nu_marg  = torch.tensor(
+                    [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
+                ).to(device)
+                c_losses = torch.div(c_losses, nu_marg + 1e-8)
+                w = exact_weights if reweight_args["reweight"] else torch.ones_like(exact_weights)
+                c_loss = (c_losses * w).sum() / w.sum()
             joint_indep_args["critic_optimizer"].zero_grad()
             c_loss.backward()
             joint_indep_args["critic_optimizer"].step()
@@ -465,17 +519,19 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 _, _, info_losses = compute_critic_loss(
                     inputs, targets, nuisances, model,
                     joint_indep_args["critic_model"], joint_indep_args["critic_criterion"],
-                    reweight_args, joint_indep_args, "train")
+                    reweight_args, joint_indep_args, "train",
+                    precomputed_activations=activations)
             if joint_indep_args.get("critic_type") == "density_ratio":
                 half = len(info_losses) // 2
                 penalty = info_losses[half:] - info_losses[:half]
                 raw_mi_val = penalty.mean().item()
                 if lam > 0.0:
                     losses_ce = losses_ce + lam * penalty
+                    info_loss_val = (lam * penalty).mean().item()
             else:
                 raw_mi_val = info_losses.mean().item()
                 if lam > 0.0:
-                    if not args.no_mi_norm:
+                    if args.mi_norm:
                         info_losses = info_losses / (info_losses.detach().mean() + 1e-8)
                     losses_ce = losses_ce - lam * info_losses
                     info_loss_val = info_losses.mean().item()
@@ -490,17 +546,24 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         loss_con    = contrastive_loss_fn(embeddings, targets)
         tensor_loss = (1 - args.contrast_weight) * loss_nurd + args.contrast_weight * loss_con
 
-        # ── ABCD closure loss (optional, batch-level MD) ───────────────────────
+        # ── ABCD closure loss (optional) ──────────────────────────────────────
+        # Uses epoch-level PCA (pca_mu/pca_W) when available so axis 2 matches
+        # eval exactly; falls back to per-batch covariance only if not provided.
         loss_closure = torch.tensor(0.0, device=device)
         if args.closure_weight > 0.0:
             qcd_mask = targets == args.qcd_label
             if qcd_mask.sum() > 10:
-                proxy_md = _proxy_md(activations, qcd_mask)
+                if pca_mu is not None:
+                    proxy_md = _proxy_md(activations, pca_mu, pca_W)
+                else:
+                    proxy_md = _proxy_md_batch(activations, qcd_mask)
                 nw = torch.ones(qcd_mask.sum(), device=device)
                 loss_closure = closure_loss_batch(
                     ae_reco[qcd_mask].float(),
                     proxy_md[qcd_mask].float(),
                     nw,
+                    n_cuts=args.closure_n_cuts,
+                    scale=args.closure_sigmoid_scale,
                 )
                 tensor_loss = tensor_loss + args.closure_weight * loss_closure
 
@@ -686,10 +749,17 @@ def main():
     }
 
     cudnn.benchmark = True
+
     best_loss = None
     for epoch in range(args.epochs):
         log.debug(f"Epoch {epoch}")
         adjust_learning_rate(optimizer, epoch)
+
+        # Refit QCD PCA each epoch so closure axis 2 stays consistent with eval.
+        pca_mu = pca_W = None
+        if args.closure_weight > 0.0:
+            pca_mu, pca_W = fit_qcd_pca(model, train_loader, device, args.qcd_label)
+            log.debug("Fitted epoch-level QCD PCA for closure axis 2")
 
         # ── per-epoch critic schedule: train critic once before main loop ─────
         if args.joint_indep and args.critic_schedule == "per_epoch":
@@ -722,7 +792,8 @@ def main():
 
         effective_lambda = get_effective_lambda(epoch) if args.critic_schedule == "warmup" else None
         train(model, train_loader, val_loader, criterion, optimizer,
-              epoch + args.reweight_epochs, log, reweight_args, joint_indep_args, effective_lambda)
+              epoch + args.reweight_epochs, log, reweight_args, joint_indep_args, effective_lambda,
+              pca_mu=pca_mu, pca_W=pca_W)
         val_loss, val_acc, val_rw_acc = validate(
             val_loader, model, criterion, epoch + args.reweight_epochs, log, reweight_args)
 
