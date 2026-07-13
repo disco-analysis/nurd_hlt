@@ -186,33 +186,16 @@ def find_best_abcd_wp(ae_qcd, md_qcd, min_A=10, min_D=100, n_scan=48):
 
 def write_datacard(
     path,
-    bins_sig,        # {"A":..., "B":..., "C":..., "D":...} — TT event counts
-    bins_bkg,        # same but for background
-    bins_obs,        # same but total (sig+bkg) — what you'd observe in data
-    nonclosure,      # float, from background-only: (A_true - A_hat) / A_hat
-    bkg_process_desc="QCD (label=1)",  # human-readable description of background
+    bins_sig,
+    bins_bkg,
+    bins_obs,
+    nonclosure,
     signal_name="tt",
     bkg_name="bkg",
-    sig_unc=0.05,    # flat signal systematic (5%)
-    lumi_unc=0.016,  # luminosity uncertainty (1.6%, CMS Run 2)
 ):
-    """
-    Write a CMS Combine ABCD datacard using rateParam.
-
-    Background ABCD relation encoded as:
-        r_A  rateParam  A  bkg  @0*@1/@2  r_B,r_C,r_D
-
-    This means the background expected in A floats freely constrained by the
-    product r_B * r_C / r_D — exactly the ABCD closure assumption.
-
-    Signal strength mu multiplies all signal rates simultaneously. The expected
-    significance is computed by Combine from the full likelihood.
-    """
-    # Guard against zeros
     N_bkg_B = max(bins_bkg["B"], 1e-3)
     N_bkg_C = max(bins_bkg["C"], 1e-3)
     N_bkg_D = max(bins_bkg["D"], 1e-3)
-    N_bkg_A_hat = N_bkg_B * N_bkg_C / N_bkg_D
 
     sig_A = max(bins_sig["A"], 1e-5)
     sig_B = max(bins_sig["B"], 1e-5)
@@ -224,51 +207,20 @@ def write_datacard(
     obs_C = int(round(bins_obs["C"]))
     obs_D = int(round(bins_obs["D"]))
 
-    nc_lnN = 1.0 + abs(nonclosure)  # lnN for nonclosure: 1 + |nc|
-
     def fmt(x): return f"{x:.4f}"
 
     lines = [
-        "# -----------------------------------------------------------------------",
-        "# CMS Combine ABCD datacard — ttbar signal search",
-        "# -----------------------------------------------------------------------",
-        "# Signal process : TT (ttbar, label==2 in SM cocktail)",
-        f"# Background      : {bkg_process_desc}",
-        "# Axis 1 (x)     : AE reconstruction loss",
-        "# Axis 2 (y)     : NURD contrastive Mahalanobis distance (MD)",
-        "#",
-        "# ABCD region layout:",
-        "#   A = axis1>t1, axis2>t2  (signal region)",
-        "#   B = axis1>t1, axis2<=t2",
-        "#   C = axis1<=t1, axis2>t2",
-        "#   D = axis1<=t1, axis2<=t2  (most background-like)",
-        "#",
-        f"# Background prediction in A: B*C/D = {N_bkg_A_hat:.2f}",
-        f"# Background true MC in A   : {bins_bkg['A']:.2f}",
-        f"# Nonclosure                : {100*nonclosure:.2f}%",
-        f"# Signal (TT) events in A   : {bins_sig['A']:.2f}",
-        "# -----------------------------------------------------------------------",
-        "",
-        "imax 4  # number of channels (one per ABCD region)",
-        "jmax 1  # one background process (all non-TT SM)",
-        "kmax *  # number of nuisance parameters (computed by Combine)",
+        "imax 4",
+        "jmax 1",
+        "kmax 0",
         "",
         60 * "-",
         "",
-        "# Observed event counts in each ABCD region",
-        f"# (In a real analysis these come from data; here: {bkg_process_desc} + TT)",
         f"bin          A        B        C        D",
         f"observation  {obs_A:<8d} {obs_B:<8d} {obs_C:<8d} {obs_D:<8d}",
         "",
         60 * "-",
         "",
-        "# Process table",
-        "# Columns: A(sig) B(sig) C(sig) D(sig) A(bkg) B(bkg) C(bkg) D(bkg)",
-        "#",
-        "# Background rate in A is set to 1 — it is scaled by the rateParam r_A",
-        "# (which is a formula rateParam = r_B * r_C / r_D, see below).",
-        "# Rates in B, C, D equal the MC expected background counts.",
-        "#",
         f"bin      {'A':<10} {'B':<10} {'C':<10} {'D':<10} {'A':<10} {'B':<10} {'C':<10} {'D':<10}",
         f"process  {signal_name:<10} {signal_name:<10} {signal_name:<10} {signal_name:<10} "
         f"{bkg_name:<10} {bkg_name:<10} {bkg_name:<10} {bkg_name:<10}",
@@ -279,42 +231,10 @@ def write_datacard(
         "",
         60 * "-",
         "",
-        "# --- Systematic uncertainties (lnN = log-normal) ---",
-        "#",
-        "# Format: name  type  A(sig) B(sig) C(sig) D(sig) A(bkg) B(bkg) C(bkg) D(bkg)",
-        "# '-' means the uncertainty does not apply to that bin/process.",
-        "",
-        f"# Luminosity uncertainty ({lumi_unc*100:.1f}%)",
-        f"lumi          lnN   {1+lumi_unc:.4f}  {1+lumi_unc:.4f}  {1+lumi_unc:.4f}  {1+lumi_unc:.4f}  -  -  -  -",
-        "",
-        f"# Signal acceptance / selection efficiency uncertainty ({sig_unc*100:.1f}%)",
-        f"sig_acc       lnN   {1+sig_unc:.4f}  {1+sig_unc:.4f}  {1+sig_unc:.4f}  {1+sig_unc:.4f}  -  -  -  -",
-        "",
-        f"# ABCD nonclosure on background in A (|nonclosure|={abs(nonclosure)*100:.1f}%)",
-        f"# Applied as a log-normal on the background in the signal region only.",
-        f"abcd_nonclosure  lnN  -  -  -  -  {nc_lnN:.4f}  -  -  -",
-        "",
-        "# --- ABCD transfer factor (rateParam) ---",
-        "#",
-        "# r_B, r_C, r_D are free parameters initialised to MC background counts.",
-        "# r_A is a formula rateParam that enforces the ABCD closure relation:",
-        "#   r_A = r_B * r_C / r_D",
-        "# Combine floats r_B, r_C, r_D to match the data in regions B, C, D,",
-        "# which then automatically predicts the background in A.",
-        "#",
-        f"r_B   rateParam  B  {bkg_name}  {fmt(N_bkg_B)}  [0,{N_bkg_B*20:.2f}]",
-        f"r_C   rateParam  C  {bkg_name}  {fmt(N_bkg_C)}  [0,{N_bkg_C*20:.2f}]",
-        f"r_D   rateParam  D  {bkg_name}  {fmt(N_bkg_D)}  [0,{N_bkg_D*20:.2f}]",
+        f"r_B   rateParam  B  {bkg_name}  {fmt(N_bkg_B)}",
+        f"r_C   rateParam  C  {bkg_name}  {fmt(N_bkg_C)}",
+        f"r_D   rateParam  D  {bkg_name}  {fmt(N_bkg_D)}",
         f"r_A   rateParam  A  {bkg_name}  @0*@1/@2  r_B,r_C,r_D",
-        "",
-        "# -----------------------------------------------------------------------",
-        "# To run expected significance with Combine:",
-        "#   combine -M Significance datacard_ttbar.txt -t -1 --expectSignal 1",
-        "# To run expected upper limit:",
-        "#   combine -M AsymptoticLimits datacard_ttbar.txt -t -1",
-        "# To fit signal strength from data (obs):",
-        "#   combine -M FitDiagnostics datacard_ttbar.txt",
-        "# -----------------------------------------------------------------------",
     ]
 
     with open(path, "w") as f:
@@ -351,8 +271,6 @@ def main():
     parser.add_argument("--min_D",      type=int,   default=100,   help="Min QCD events in D for WP scan")
     parser.add_argument("--outdir",     default="outputs_datacard", help="Output directory")
     parser.add_argument("--datacard_name", default="datacard_ttbar.txt")
-    parser.add_argument("--sig_unc",    type=float, default=0.05,  help="Signal systematic (flat fraction)")
-    parser.add_argument("--lumi_unc",   type=float, default=0.016, help="Lumi uncertainty (fraction)")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -480,9 +398,6 @@ def main():
         bins_bkg=bins_bkg,
         bins_obs=bins_obs,
         nonclosure=nc_for_card,
-        bkg_process_desc=bkg_process_desc,
-        sig_unc=args.sig_unc,
-        lumi_unc=args.lumi_unc,
     )
 
     # ── save summary JSON ─────────────────────────────────────────────────────
