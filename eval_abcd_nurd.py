@@ -17,6 +17,7 @@ python eval_abcd_nurd.py \
 """
 import os
 import gc
+import json
 import argparse
 import numpy as np
 import torch
@@ -175,16 +176,10 @@ def embed_pf(model, pt_path, device, batch_size=512):
     return torch.cat(latents, dim=0).numpy(), labels
 
 
-def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None):
-    """
-    Embed all events, fit PCA whitening on QCD (label==1) latents,
-    return (md_scores [N], labels [N], mu, W, latents [N,D]).
-    """
-    latents, labels = embed_pf(model, pt_path, device, batch_size)
-
-    qcd_mask = (labels == 1)
-    ref = latents[qcd_mask]
-    print(f"  PCA whitening fit on {qcd_mask.sum()} QCD events (dim={ref.shape[1]})...", flush=True)
+def _fit_class_transform(embeddings, mask, n_pca, class_name):
+    """Fit PCA whitening on embeddings[mask]. Returns (mu, W)."""
+    ref = embeddings[mask]
+    print(f"  Fitting PCA whitening on {mask.sum()} {class_name} events (dim={ref.shape[1]})...", flush=True)
     mu = ref.mean(axis=0)
     centered = ref - mu
     cov = (centered.T @ centered) / ref.shape[0]
@@ -192,13 +187,54 @@ def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None):
     if n_pca is not None:
         V = V[:, -n_pca:]
         L = L[-n_pca:]
-        print(f"  Using top {n_pca} PCA components for MD", flush=True)
+        print(f"    Using top {n_pca} PCA components", flush=True)
     L = np.clip(L, 1e-6, None)
     W = V / np.sqrt(L)
+    return mu, W
 
-    z  = (latents - mu) @ W
-    md = (z * z).sum(axis=1).astype(np.float32)
-    return md, labels, mu, W, latents
+
+def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None, bkg_labels=None):
+    """
+    Embed all events, fit PCA whitening per background class, return MD scores.
+
+    bkg_labels: list of class labels to use as reference.
+      [1]       (default) → QCD-only MD.
+      [0, 1, 3] → min-MD across DY, QCD, WJets (element-wise minimum).
+
+    Returns (md [N], labels [N], mu_qcd, W_qcd, latents [N,D], class_transforms).
+    class_transforms is a list of (label, mu, W) — reuse for signal inference.
+    """
+    _CLASS_NAMES = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
+    if bkg_labels is None:
+        bkg_labels = [1]
+
+    latents, labels = embed_pf(model, pt_path, device, batch_size)
+
+    class_transforms = []
+    for cls in bkg_labels:
+        mask = (labels == cls)
+        if mask.sum() < 10:
+            print(f"  WARNING: class {cls} has only {mask.sum()} events — skipping", flush=True)
+            continue
+        mu, W = _fit_class_transform(latents, mask, n_pca, _CLASS_NAMES.get(cls, str(cls)))
+        class_transforms.append((cls, mu, W))
+
+    if not class_transforms:
+        raise RuntimeError("No background classes with enough events.")
+
+    md_per_class = []
+    for cls, mu_c, W_c in class_transforms:
+        z_c = (latents - mu_c) @ W_c
+        md_per_class.append((z_c * z_c).sum(axis=1))
+    md = np.stack(md_per_class, axis=0).min(axis=0).astype(np.float32)
+
+    if len(class_transforms) > 1:
+        print(f"  Min-MD across classes {[c for c,_,_ in class_transforms]}", flush=True)
+
+    qcd_entry = next((t for t in class_transforms if t[0] == 1), class_transforms[0])
+    mu_qcd, W_qcd = qcd_entry[1], qcd_entry[2]
+
+    return md, labels, mu_qcd, W_qcd, latents, class_transforms
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -206,8 +242,11 @@ def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None):
 def ABCD(config):
     print("Logging in to wandb...", flush=True)
     wandb.login()
-    wandb.init(project="AE vs. Contrastive ABCD",
+    resume_id = config.get("resume_run_id", None)
+    wandb.init(project=config.get("wandb_project", "AE vs. Contrastive ABCD"),
                name=config.get("wandb_run_name", None),
+               id=resume_id,
+               resume="allow" if resume_id else None,
                settings=wandb.Settings(_disable_stats=True),
                config=config)
     run_name = wandb.run.name
@@ -235,10 +274,14 @@ def ABCD(config):
         torch.cuda.empty_cache()
 
     # ── contrastive MD scores ─────────────────────────────────────────────────
+    bkg_labels = [0, 1, 3] if config.get("min_md") else [1]
+    if config.get("min_md"):
+        print("Min-MD mode: axis 2 = min(MD_DY, MD_QCD, MD_WJets)", flush=True)
     print("Computing contrastive MD scores (bkg)...", flush=True)
-    con_bkg, labels, md_mu, md_W, latents_all = compute_md_scores(
+    con_bkg, labels, md_mu, md_W, latents_all, class_transforms = compute_md_scores(
         model, config["test_pt"], device,
         n_pca=config.get("n_pca"),
+        bkg_labels=bkg_labels,
     )
 
     if len(con_bkg) != len(ae_bkg):
@@ -270,8 +313,11 @@ def ABCD(config):
             torch.cuda.empty_cache()
         print("Running signal inference...", flush=True)
         sig_latents, _ = embed_pf(model, config["signal_pt"], device)
-        sig_z   = (sig_latents - md_mu) @ md_W
-        sig_con = (sig_z * sig_z).sum(axis=1).astype(np.float32)
+        sig_mds = []
+        for cls, mu_c, W_c in class_transforms:
+            z_c = (sig_latents - mu_c) @ W_c
+            sig_mds.append((z_c * z_c).sum(axis=1))
+        sig_con = np.stack(sig_mds, axis=0).min(axis=0).astype(np.float32)
 
         ae_sig = load_ae(config["ae_ckpt"], ae_scaler, device)
         sig_ae = compute_ae_scores(ae_sig, ae_scaler, config["signal_pt"], device)
@@ -286,7 +332,7 @@ def ABCD(config):
         print(f"Signal events after masking: {sig_mask.sum()}", flush=True)
 
     # ── ABCD scan ─────────────────────────────────────────────────────────────
-    percent = np.linspace(0.75, 0.98, 24)
+    percent = np.linspace(0.50, 0.98, 48)
     best    = {"nonclosure": np.inf}
     min_A   = int(config.get("min_A", 50))
     min_D   = int(config.get("min_D", 500))
@@ -619,6 +665,19 @@ def ABCD(config):
     plt.savefig(closure_path, dpi=200, bbox_inches="tight"); plt.close()
     wandb.log({"Closure/plot": wandb.Image(closure_path)})
 
+    # Save thresholds JSON so make_datacard_ttbar.py can skip the scan
+    thresholds_path = os.path.join(outdir, "abcd_thresholds.json")
+    with open(thresholds_path, "w") as f:
+        json.dump({
+            "t1":    float(t1_opt),
+            "t2":    float(t2_opt),
+            "p1":    float(best["p1"]),
+            "p2":    float(best["p2"]),
+            "n_pca": config.get("n_pca", None),
+            "nonclosure": float(best["nonclosure"]),
+        }, f, indent=2)
+    print(f"Thresholds saved to: {thresholds_path}", flush=True)
+
     wandb.finish()
 
 
@@ -638,7 +697,13 @@ if __name__ == "__main__":
     parser.add_argument("--n_pca",        type=int, default=None,
                         help="Number of PCA components for MD (default: keep all latent dims)")
     parser.add_argument("--wandb_run_name", default=None)
+    parser.add_argument("--wandb_project",  default="AE vs. Contrastive ABCD",
+                        help="W&B project to log to")
+    parser.add_argument("--resume_run_id",  default=None,
+                        help="Resume an existing W&B run (e.g. the training run from a sweep)")
     parser.add_argument("--skip_pca_md_plots",   action="store_true")
     parser.add_argument("--skip_embedding_pca",  action="store_true")
+    parser.add_argument("--min_md",              action="store_true",
+                        help="Use min-MD across DY+QCD+WJets (labels 0,1,3) instead of QCD-only MD")
     args = parser.parse_args()
     ABCD(vars(args))
