@@ -1,43 +1,8 @@
 """
-make_datacard_ttbar.py
-
-Produces a CMS Combine ABCD datacard for a ttbar signal search using the
-HLT NURD contrastive model.
-
-Two discriminating axes:
-  Axis 1 (x): AE reconstruction loss  — measures how "surprising" an event is to the AE
-  Axis 2 (y): Mahalanobis distance in PCA-whitened NURD latent space
-
-ABCD regions (defined by thresholds t1, t2):
-
-         axis2 (MD)
-         ^
-  high   |   C     |   A (signal region)
-         |---------|----------
-  low    |   D     |   B
-         +---------|---------> axis1 (AE loss)
-                  t1
-
-Background prediction in A: N_bkg_A_hat = N_bkg_B * N_bkg_C / N_bkg_D
-Signal = TT events (label == 2 in the SM cocktail dataset)
-Background = DY (0) + QCD (1) + WJets (3)
-
-Thresholds are optimised on QCD-only events (same as eval_abcd_nurd.py).
-
-Usage:
-------
-python make_datacard_ttbar.py \\
-    --ckpt    /path/to/checkpoint_main.pth.tar \\
-    --ae_ckpt /path/to/checkpoint_ae.pth \\
-    --test_pt /path/to/hlt_smcocktail_test.pt \\
-    [--n_pca 6] \\
-    [--p1 0.90 --p2 0.90]  # explicit thresholds instead of scanning \\
-    [--outdir outputs_datacard] \\
-    [--datacard_name datacard_ttbar.txt]
-
-The script writes:
-  <outdir>/datacard_ttbar.txt   — CMS Combine ABCD datacard
-  <outdir>/abcd_summary.json    — all ABCD counts and thresholds for bookkeeping
+Produces a CMS Combine ABCD datacard for a ttbar signal search.
+Axis 1: AE reco loss. Axis 2: Mahalanobis distance in NURD latent space.
+Signal: TT (label=2). Background: DY (0) + QCD (1) + WJets (3).
+Writes <outdir>/datacard_ttbar.txt and <outdir>/abcd_summary.json.
 """
 
 import os
