@@ -2,7 +2,7 @@
 Produces a CMS Combine ABCD datacard for a ttbar signal search.
 Axis 1: AE reco loss. Axis 2: Mahalanobis distance in NURD latent space.
 Signal: TT (label=2). Background: DY (0) + QCD (1) + WJets (3).
-Writes <outdir>/datacard_ttbar.txt and <outdir>/abcd_summary.json.
+Writes <outdir>/datacard_ttbar.txt (ABCD), <outdir>/datacard_ttbar_cnt.txt (cut-and-count), and <outdir>/abcd_summary.json.
 """
 
 import os
@@ -197,10 +197,10 @@ def write_datacard(
     N_bkg_C = max(bins_bkg["C"], 1e-3)
     N_bkg_D = max(bins_bkg["D"], 1e-3)
 
-    sig_A = max(bins_sig["A"], 1e-5)
-    sig_B = max(bins_sig["B"], 1e-5)
-    sig_C = max(bins_sig["C"], 1e-5)
-    sig_D = max(bins_sig["D"], 1e-5)
+    sig_A = bins_sig["A"]
+    sig_B = bins_sig["B"]
+    sig_C = bins_sig["C"]
+    sig_D = bins_sig["D"]
 
     obs_A = int(round(bins_obs["A"]))
     obs_B = int(round(bins_obs["B"]))
@@ -240,6 +240,35 @@ def write_datacard(
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"Datacard written to: {path}")
+
+
+def write_datacard_cnt(path, sig_A, bkg_A, obs_A, signal_name="tt", bkg_name="bkg"):
+    """Single-bin cut-and-count datacard for signal region A. Background from MC directly."""
+    def fmt(x): return f"{x:.4f}"
+
+    lines = [
+        "imax 1",
+        "jmax 1",
+        "kmax 0",
+        "",
+        60 * "-",
+        "",
+        f"bin          A",
+        f"observation  {int(round(obs_A))}",
+        "",
+        60 * "-",
+        "",
+        f"bin      {'A':<10} {'A':<10}",
+        f"process  {signal_name:<10} {bkg_name:<10}",
+        f"process  {'0':<10} {'1':<10}",
+        f"rate     {fmt(sig_A):<10} {fmt(bkg_A):<10}",
+        "",
+        60 * "-",
+    ]
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"Cut-and-count datacard written to: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +419,7 @@ def main():
     # Use the larger of the two nonclosure estimates as the systematic
     nc_for_card = max(abs(nonclosure_bkg), abs(nonclosure_qcd) if nonclosure_qcd else 0)
 
-    # ── write datacard ────────────────────────────────────────────────────────
+    # ── write datacards ───────────────────────────────────────────────────────
     card_path = os.path.join(args.outdir, args.datacard_name)
     write_datacard(
         card_path,
@@ -398,6 +427,14 @@ def main():
         bins_bkg=bins_bkg,
         bins_obs=bins_obs,
         nonclosure=nc_for_card,
+    )
+
+    cnt_name = args.datacard_name.replace(".txt", "_cnt.txt")
+    write_datacard_cnt(
+        os.path.join(args.outdir, cnt_name),
+        sig_A=bins_sig["A"],
+        bkg_A=bins_bkg["A"],
+        obs_A=bins_obs["A"],
     )
 
     # ── save summary JSON ─────────────────────────────────────────────────────
