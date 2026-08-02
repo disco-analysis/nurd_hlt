@@ -2,7 +2,8 @@
 ABCD eval for the NURD contrastive checkpoint (hlt_nurd_con).
 
 Axis 1: AE reco loss (HLTAutoencoder, loaded from separate ae_ckpt)
-Axis 2: Mahalanobis distance in PCA-whitened NURD latent space
+Axis 2: Mahalanobis distance in PCA-whitened NURD latent space (default)
+        OR 1-P(QCD) classifier logit score (--axis2_logit)
 
 Usage
 -----
@@ -12,6 +13,7 @@ python eval_abcd_nurd.py \
     --test_pt   /eos/user/e/escheull/smcocktail_1M_noZB/hlt_smcocktail_test.pt \
     [--signal_pt /eos/user/e/escheull/signal_pt/hlt_signal_TpTp.pt] \
     [--n_pca 6] \
+    [--axis2_logit]  # use 1-P(QCD) instead of MD
     [--outdir /eos/user/e/escheull/abcd_outputs] \
     [--wandb_run_name nurd_abcd_v1]
 """
@@ -36,13 +38,35 @@ from models.hlt_autoencoder import HLTAutoencoder
 
 # ── ABCD helpers (identical to eval_abcd.py) ─────────────────────────────────
 
-def abcd_counts(loss_1, loss_2, percent_1, percent_2):
-    thresh_1 = np.quantile(loss_1, percent_1)
-    thresh_2 = np.quantile(loss_2, percent_2)
-    A = int(((loss_1 > thresh_1) & (loss_2 > thresh_2)).sum())
-    B = int(((loss_1 > thresh_1) & (loss_2 <= thresh_2)).sum())
-    C = int(((loss_1 <= thresh_1) & (loss_2 > thresh_2)).sum())
-    D = int(((loss_1 <= thresh_1) & (loss_2 <= thresh_2)).sum())
+def weighted_quantile(values, q, weights):
+    """Weighted quantile: threshold where cumulative weight reaches q * total_weight."""
+    sorter = np.argsort(values)
+    sv = values[sorter]
+    sw = weights[sorter]
+    cumw = np.cumsum(sw)
+    idx = np.searchsorted(cumw, q * cumw[-1])
+    return sv[np.clip(idx, 0, len(sv) - 1)]
+
+
+def abcd_counts(loss_1, loss_2, percent_1, percent_2, weights=None):
+    if weights is not None:
+        thresh_1 = weighted_quantile(loss_1, percent_1, weights)
+        thresh_2 = weighted_quantile(loss_2, percent_2, weights)
+        m_A = (loss_1 > thresh_1) & (loss_2 > thresh_2)
+        m_B = (loss_1 > thresh_1) & (loss_2 <= thresh_2)
+        m_C = (loss_1 <= thresh_1) & (loss_2 > thresh_2)
+        m_D = (loss_1 <= thresh_1) & (loss_2 <= thresh_2)
+        A = float(weights[m_A].sum())
+        B = float(weights[m_B].sum())
+        C = float(weights[m_C].sum())
+        D = float(weights[m_D].sum())
+    else:
+        thresh_1 = np.quantile(loss_1, percent_1)
+        thresh_2 = np.quantile(loss_2, percent_2)
+        A = int(((loss_1 > thresh_1) & (loss_2 > thresh_2)).sum())
+        B = int(((loss_1 > thresh_1) & (loss_2 <= thresh_2)).sum())
+        C = int(((loss_1 <= thresh_1) & (loss_2 > thresh_2)).sum())
+        D = int(((loss_1 <= thresh_1) & (loss_2 <= thresh_2)).sum())
     return thresh_1, thresh_2, A, B, C, D
 
 
@@ -159,21 +183,34 @@ def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096):
     return torch.cat(scores).numpy().astype(np.float32)
 
 
-def embed_pf(model, pt_path, device, batch_size=512):
-    """Run NURD encoder on PF candidates; return (latents [N,D], labels [N])."""
+def embed_pf(model, pt_path, device, batch_size=512, return_logits=False):
+    """Run NURD encoder on PF candidates; return (latents [N,D], labels [N]).
+    If return_logits=True, returns (latents, logits [N,C], labels)."""
     raw    = torch.load(pt_path, map_location="cpu")
     pf     = torch.nan_to_num(raw["pf"], nan=0.0, posinf=0.0, neginf=0.0)
     labels = raw["label"].numpy()
     N = pf.shape[0]
     print(f"  Encoder inference on {N} events from {pt_path}...", flush=True)
 
-    latents = []
+    latents, logits_list = [], []
     with torch.no_grad():
         for i0 in range(0, N, batch_size):
             xb = pf[i0:i0 + batch_size].to(device)
-            latent, _ = model(xb)
+            latent, logit = model(xb)
             latents.append(latent.cpu())
+            if return_logits:
+                logits_list.append(logit.cpu())
+    if return_logits:
+        return (torch.cat(latents, dim=0).numpy(),
+                torch.cat(logits_list, dim=0).numpy(),
+                labels)
     return torch.cat(latents, dim=0).numpy(), labels
+
+
+def compute_logit_axis2(logits, qcd_label=1):
+    """1 - P(QCD) from classifier logits — higher means more anomalous."""
+    probs = F.softmax(torch.from_numpy(logits.astype(np.float32)), dim=1).numpy()
+    return (1.0 - probs[:, qcd_label]).astype(np.float32)
 
 
 def _fit_class_transform(embeddings, mask, n_pca, class_name):
@@ -273,16 +310,29 @@ def ABCD(config):
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    # ── contrastive MD scores ─────────────────────────────────────────────────
-    bkg_labels = [0, 1, 3] if config.get("min_md") else [1]
-    if config.get("min_md"):
-        print("Min-MD mode: axis 2 = min(MD_DY, MD_QCD, MD_WJets)", flush=True)
-    print("Computing contrastive MD scores (bkg)...", flush=True)
-    con_bkg, labels, md_mu, md_W, latents_all, class_transforms = compute_md_scores(
-        model, config["test_pt"], device,
-        n_pca=config.get("n_pca"),
-        bkg_labels=bkg_labels,
-    )
+    # ── axis 2 scores (MD or logit) ───────────────────────────────────────────
+    use_logit  = config.get("axis2_logit", False)
+    axis2_label = "1-P(QCD)" if use_logit else "NURD Contrastive score (MD)"
+    axis2_log_scale = not use_logit   # MD → log y; logit ∈ [0,1] → linear y
+
+    # always need latents for PCA embedding plots; get logits too when requested
+    if use_logit:
+        print("Axis 2 = 1-P(QCD) logit mode.", flush=True)
+        latents_all, logits_all, labels = embed_pf(
+            model, config["test_pt"], device, return_logits=True)
+        con_bkg = compute_logit_axis2(logits_all, qcd_label=config.get("qcd_label", 1))
+        class_transforms = []   # not used in logit mode
+        md_mu = md_W = None
+    else:
+        bkg_labels = [0, 1, 3] if config.get("min_md") else [1]
+        if config.get("min_md"):
+            print("Min-MD mode: axis 2 = min(MD_DY, MD_QCD, MD_WJets)", flush=True)
+        print("Computing contrastive MD scores (bkg)...", flush=True)
+        con_bkg, labels, md_mu, md_W, latents_all, class_transforms = compute_md_scores(
+            model, config["test_pt"], device,
+            n_pca=config.get("n_pca"),
+            bkg_labels=bkg_labels,
+        )
 
     if len(con_bkg) != len(ae_bkg):
         raise ValueError(f"Length mismatch: contrastive {len(con_bkg)} vs AE {len(ae_bkg)}")
@@ -295,14 +345,35 @@ def ABCD(config):
     latents_masked = latents_all[mask]
     print(f"Events after masking: {mask.sum()}", flush=True)
 
-    emb_pca  = (latents_masked - md_mu) @ md_W
-    n_pca    = emb_pca.shape[1]
-    axis2_pca = axis2_bkg
+    if not use_logit:
+        emb_pca   = (latents_masked - md_mu) @ md_W
+        n_pca     = emb_pca.shape[1]
+        axis2_pca = axis2_bkg
+    else:
+        # still compute a 2D PCA of the latent for the embedding scatter plot
+        from sklearn.decomposition import PCA as _PCA
+        _pca_fit = _PCA(n_components=min(6, latents_masked.shape[1]))
+        _pca_fit.fit(latents_masked[labels_masked == 1])
+        emb_pca   = _pca_fit.transform(latents_masked)
+        n_pca     = emb_pca.shape[1]
+        axis2_pca = axis2_bkg   # same axis in logit mode
 
     qcd_only  = labels_masked == 1
     axis1_qcd = axis1_bkg[qcd_only]
-    axis2_qcd = axis2_pca[qcd_only]
+    axis2_qcd = axis2_bkg[qcd_only]
     print(f"QCD events for ABCD: {qcd_only.sum()}", flush=True)
+
+    # ── gen weights (QCD only, for weighted ABCD) ─────────────────────────────
+    gen_weights_qcd = None
+    if config.get("gen_weight_path"):
+        gw_all = torch.load(config["gen_weight_path"], map_location="cpu").float().numpy()
+        n_test = len(ae_bkg)
+        if len(gw_all) != n_test:
+            raise ValueError(
+                f"gen_weight_path has {len(gw_all)} entries but test file has {n_test} events")
+        gen_weights_qcd = gw_all[mask][qcd_only]
+        print(f"Gen weights loaded: {len(gen_weights_qcd)} QCD weights "
+              f"(min={gen_weights_qcd.min():.3e}, max={gen_weights_qcd.max():.3e})", flush=True)
 
     # ── signal (optional) ─────────────────────────────────────────────────────
     sig_axis1 = sig_axis2 = sig_axis2_pca = None
@@ -312,23 +383,33 @@ def ABCD(config):
         if device == "cuda":
             torch.cuda.empty_cache()
         print("Running signal inference...", flush=True)
-        sig_latents, _ = embed_pf(model, config["signal_pt"], device)
-        sig_mds = []
-        for cls, mu_c, W_c in class_transforms:
-            z_c = (sig_latents - mu_c) @ W_c
-            sig_mds.append((z_c * z_c).sum(axis=1))
-        sig_con = np.stack(sig_mds, axis=0).min(axis=0).astype(np.float32)
 
         ae_sig = load_ae(config["ae_ckpt"], ae_scaler, device)
         sig_ae = compute_ae_scores(ae_sig, ae_scaler, config["signal_pt"], device)
         del ae_sig
 
+        if use_logit:
+            sig_latents, sig_logits, _ = embed_pf(
+                model, config["signal_pt"], device, return_logits=True)
+            sig_con = compute_logit_axis2(sig_logits, qcd_label=config.get("qcd_label", 1))
+        else:
+            sig_latents, _ = embed_pf(model, config["signal_pt"], device)
+            sig_mds = []
+            for cls, mu_c, W_c in class_transforms:
+                z_c = (sig_latents - mu_c) @ W_c
+                sig_mds.append((z_c * z_c).sum(axis=1))
+            sig_con = np.stack(sig_mds, axis=0).min(axis=0).astype(np.float32)
+
         sig_mask = np.isfinite(sig_ae) & np.isfinite(sig_con) & (sig_ae > 0)
-        sig_axis1         = sig_ae[sig_mask]
-        sig_axis2         = sig_con[sig_mask]
+        sig_axis1          = sig_ae[sig_mask]
+        sig_axis2          = sig_con[sig_mask]
         sig_latents_masked = sig_latents[sig_mask]
-        sig_emb_pca       = (sig_latents_masked - md_mu) @ md_W
-        sig_axis2_pca     = (sig_emb_pca * sig_emb_pca).sum(axis=1).astype(np.float32)
+        if not use_logit:
+            sig_emb_pca   = (sig_latents_masked - md_mu) @ md_W
+            sig_axis2_pca = (sig_emb_pca * sig_emb_pca).sum(axis=1).astype(np.float32)
+        else:
+            sig_emb_pca   = _pca_fit.transform(sig_latents_masked)
+            sig_axis2_pca = sig_axis2
         print(f"Signal events after masking: {sig_mask.sum()}", flush=True)
 
     # ── ABCD scan ─────────────────────────────────────────────────────────────
@@ -337,12 +418,15 @@ def ABCD(config):
     min_A   = int(config.get("min_A", 50))
     min_D   = int(config.get("min_D", 500))
 
-    for p1 in percent:
-        for p2 in percent:
-            t1, t2, A, B, C, D = abcd_counts(axis1_qcd, axis2_qcd, p1, p2)
+    nc_grid = np.full((len(percent), len(percent)), np.nan)
+
+    for i, p1 in enumerate(percent):
+        for j, p2 in enumerate(percent):
+            t1, t2, A, B, C, D = abcd_counts(axis1_qcd, axis2_qcd, p1, p2, weights=gen_weights_qcd)
             if A < min_A or D < min_D:
                 continue
             nc, A_hat = nonclosure_A(A, B, C, D)
+            nc_grid[i, j] = nc
             if np.isfinite(nc) and abs(nc) < abs(best["nonclosure"]):
                 best.update(dict(p1=p1, p2=p2, t1=t1, t2=t2,
                                  A=A, B=B, C=C, D=D, A_hat=A_hat, nonclosure=nc))
@@ -372,15 +456,46 @@ def ABCD(config):
     class_names  = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
     class_colors = {0: "tab:blue", 1: "tab:orange", 2: "tab:green", 3: "tab:red"}
 
+    # 2D closure scan — full (p1, p2) grid coloured by |non-closure|
+    fig, ax = plt.subplots(figsize=(7.5, 6.5))
+    pct_abs = np.clip(np.abs(nc_grid) * 100.0, 0.0, 100.0)
+    vmax = float(np.nanpercentile(pct_abs, 95)) if np.any(np.isfinite(pct_abs)) else 100.0
+    mesh = ax.pcolormesh(percent, percent, pct_abs.T, cmap="viridis_r",
+                         vmin=0.0, vmax=vmax, shading="auto")
+    cb = fig.colorbar(mesh, ax=ax)
+    cb.set_label("|Non-closure| (%)", fontsize=fs_leg)
+    ax.scatter([best["p1"]], [best["p2"]], marker="*", s=400, color="red",
+               edgecolor="black", linewidth=1.0, zorder=5,
+               label=f"Optimized: p1={best['p1']:.3f}, p2={best['p2']:.3f}\n"
+                     f"|non-closure|={100.0*abs(best['nonclosure']):.2f}%")
+    ax.set_xlabel("Percentile threshold, axis 1 (AE reco loss)", fontsize=fs_leg)
+    ax.set_ylabel("Percentile threshold, axis 2 (NURD contrastive MD)", fontsize=fs_leg)
+    ax.set_title("ABCD closure scan (full grid)", fontsize=fs_leg)
+    ax.legend(loc="lower left", fontsize=12, framealpha=0.9)
+    fig.tight_layout()
+    out_scan2d = os.path.join(plot_dir, "closure_scan_2d.png")
+    fig.savefig(out_scan2d, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    wandb.log({"Closure/scan_2d": wandb.Image(out_scan2d)})
+
+    # helper: apply y-scale and bins depending on axis2 type
+    def _hist2d_axis2(fig_or_ax, x, y, xbins, set_labels=True):
+        if axis2_log_scale:
+            ybins = np.geomspace(y[y > 0].min(), y.max(), 201)
+        else:
+            ybins = np.linspace(y.min(), y.max(), 201)
+        plt.hist2d(x, y, bins=[xbins, ybins], norm=LogNorm(vmin=1), cmin=1)
+        plt.xscale("log")
+        if axis2_log_scale:
+            plt.yscale("log")
+
     # 2D histogram (all bkg)
     fig = plt.figure(figsize=(6, 5))
     xbins = np.geomspace(axis1_bkg[axis1_bkg > 0].min(), axis1_bkg.max(), 201)
-    ybins = np.geomspace(axis2_bkg[axis2_bkg > 0].min(), axis2_bkg.max(), 201)
-    plt.hist2d(axis1_bkg, axis2_bkg, bins=[xbins, ybins], norm=LogNorm(vmin=1), cmin=1)
-    plt.xscale("log"); plt.yscale("log")
+    _hist2d_axis2(fig, axis1_bkg, axis2_bkg, xbins)
     plt.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
     plt.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
-    plt.xlabel("AE reco loss"); plt.ylabel("NURD Contrastive score (MD)")
+    plt.xlabel("AE reco loss"); plt.ylabel(axis2_label)
     plt.title("AE vs NURD Contrastive (bkg only)"); plt.colorbar(label="Counts")
     out = os.path.join(plot_dir, "hist2d_bkg.png")
     plt.savefig(out, dpi=200, bbox_inches="tight"); plt.close()
@@ -399,9 +514,11 @@ def ABCD(config):
                    color="tab:purple", label="TpTp", rasterized=True)
     ax.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
     ax.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
-    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xscale("log")
+    if axis2_log_scale:
+        ax.set_yscale("log")
     ax.set_xlabel("AE reco loss", fontsize=fs)
-    ax.set_ylabel("NURD Contrastive score (MD)", fontsize=fs)
+    ax.set_ylabel(axis2_label, fontsize=fs)
     ax.set_title("AE vs NURD Contrastive — all classes")
     ax.legend(markerscale=10, fontsize=fs_legend)
     out_combined = os.path.join(plot_dir, "hist2d_by_class_combined.png")
@@ -412,12 +529,10 @@ def ABCD(config):
     if sig_axis1 is not None:
         fig = plt.figure(figsize=(6, 5))
         xbins_s = np.geomspace(sig_axis1[sig_axis1 > 0].min(), sig_axis1.max(), 101)
-        ybins_s = np.geomspace(sig_axis2[sig_axis2 > 0].min(), sig_axis2.max(), 101)
-        plt.hist2d(sig_axis1, sig_axis2, bins=[xbins_s, ybins_s], norm=LogNorm(vmin=1), cmin=1)
-        plt.xscale("log"); plt.yscale("log")
+        _hist2d_axis2(fig, sig_axis1, sig_axis2, xbins_s)
         plt.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
         plt.xlabel("AE reco loss", fontsize=fs)
-        plt.ylabel("NURD Contrastive score (MD)", fontsize=fs)
+        plt.ylabel(axis2_label, fontsize=fs)
         plt.title("AE vs NURD Contrastive — TpTp (signal)"); plt.colorbar(label="Counts")
         out_sig = os.path.join(plot_dir, "hist2d_TpTp.png")
         plt.savefig(out_sig, dpi=200, bbox_inches="tight"); plt.close()
@@ -431,19 +546,17 @@ def ABCD(config):
         x_cls, y_cls = axis1_bkg[m], axis2_bkg[m]
         fig = plt.figure(figsize=(6, 5))
         xbins_c = np.geomspace(x_cls[x_cls > 0].min(), x_cls.max(), 101)
-        ybins_c = np.geomspace(y_cls[y_cls > 0].min(), y_cls.max(), 101)
-        plt.hist2d(x_cls, y_cls, bins=[xbins_c, ybins_c], norm=LogNorm(vmin=1), cmin=1)
-        plt.xscale("log"); plt.yscale("log")
+        _hist2d_axis2(fig, x_cls, y_cls, xbins_c)
         plt.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
         plt.xlabel("AE reco loss", fontsize=fs)
-        plt.ylabel("NURD Contrastive score (MD)", fontsize=fs)
+        plt.ylabel(axis2_label, fontsize=fs)
         plt.title(f"AE vs NURD Contrastive — {name}"); plt.colorbar(label="Counts")
         out_cls = os.path.join(plot_dir, f"hist2d_{name}.png")
         plt.savefig(out_cls, dpi=200, bbox_inches="tight"); plt.close()
         wandb.log({f"Hists2D/{name}": wandb.Image(out_cls)})
 
-    # PCA-MD scatter + KDE
-    if not config.get("skip_pca_md_plots"):
+    # PCA-MD scatter + KDE (MD mode only — not meaningful for logit axis)
+    if not use_logit and not config.get("skip_pca_md_plots"):
         fig, ax = plt.subplots(figsize=fig_size)
         for cls, name in class_names.items():
             m = labels_masked == cls
@@ -505,7 +618,6 @@ def ABCD(config):
             kde = gaussian_kde(np.vstack([lx, ly]))
             zi  = kde(np.vstack([xi_global.flatten(), yi_global.flatten()]))
             zi_grid = zi.reshape(xi_global.shape)
-            # only draw contours in the bulk; suppress far-tail lines
             levels = zi_grid.max() * np.array([0.05, 0.15, 0.3, 0.5, 0.7, 0.88])
             ax.contour(10**xi_global, 10**yi_global, zi_grid,
                        levels=levels, colors=color, alpha=0.7, linewidths=1.5)
@@ -525,7 +637,7 @@ def ABCD(config):
         fig.savefig(out_pca_kde, dpi=200, bbox_inches="tight"); plt.close(fig)
         wandb.log({"Hists2D/pca_md_kde": wandb.Image(out_pca_kde)})
 
-    # PCA embedding scatter + KDE
+    # PCA embedding scatter
     if not config.get("skip_embedding_pca"):
         pca2 = PCA(n_components=2)
         pca2.fit(latents_masked[labels_masked == 1])
@@ -553,8 +665,8 @@ def ABCD(config):
         fig.savefig(out_pca_scatter2, dpi=200, bbox_inches="tight"); plt.close(fig)
         wandb.log({"PCA/scatter": wandb.Image(out_pca_scatter2)})
 
-    # Corner plot: pairwise PCA-MD components
-    if n_pca >= 2:
+    # Corner plot: pairwise PCA components (MD mode only)
+    if not use_logit and n_pca >= 2:
         pairs  = [(i, j) for i in range(n_pca) for j in range(i + 1, n_pca)]
         n_pairs = len(pairs)
         fig, axes = plt.subplots(1, n_pairs, figsize=(6 * n_pairs, 5))
@@ -582,14 +694,14 @@ def ABCD(config):
         wandb.log({"PCA/corner": wandb.Image(out_corner)})
 
     # Profile plots
-    for (x_arr, y_arr, xlabel, ylabel, title, key) in [
-        (axis2_bkg, axis1_bkg, "NURD Contrastive score (MD)", "Mean AE reco loss",
-         "⟨AE loss⟩ vs NURD MD", "AE_vs_contrastive"),
-        (axis1_bkg, axis2_bkg, "AE reco loss", "Mean NURD Contrastive score (MD)",
-         "⟨NURD MD⟩ vs AE loss", "contrastive_vs_AE"),
+    for (x_arr, y_arr, xlabel, ylabel, title, key, logx_flag) in [
+        (axis2_bkg, axis1_bkg, axis2_label, "Mean AE reco loss",
+         f"⟨AE loss⟩ vs {axis2_label}", "AE_vs_contrastive", axis2_log_scale),
+        (axis1_bkg, axis2_bkg, "AE reco loss", f"Mean {axis2_label}",
+         f"⟨{axis2_label}⟩ vs AE loss", "contrastive_vs_AE", True),
     ]:
         fig, ax = plt.subplots(figsize=fig_size)
-        profile_plot(ax, x_arr, y_arr, nbins=60, logx=True)
+        profile_plot(ax, x_arr, y_arr, nbins=60, logx=logx_flag)
         ax.set_xlabel(xlabel, fontsize=fs); ax.set_ylabel(ylabel, fontsize=fs)
         ax.set_title(title)
         plt.tick_params(axis="x", labelsize=fs_leg)
@@ -598,18 +710,18 @@ def ABCD(config):
         fig.savefig(out_p, dpi=200, bbox_inches="tight"); plt.close(fig)
         wandb.log({f"Profiles/{key}": wandb.Image(out_p)})
 
-    for (x_arr, y_arr, xlabel, ylabel, title, key) in [
-        (axis2_bkg, axis1_bkg, "NURD Contrastive score (MD)", "Mean AE reco loss",
-         "⟨AE loss⟩ vs NURD MD (by class)", "AE_vs_contrastive_by_class"),
-        (axis1_bkg, axis2_bkg, "AE reco loss", "Mean NURD Contrastive score (MD)",
-         "⟨NURD MD⟩ vs AE loss (by class)", "contrastive_vs_AE_by_class"),
+    for (x_arr, y_arr, xlabel, ylabel, title, key, logx_flag) in [
+        (axis2_bkg, axis1_bkg, axis2_label, "Mean AE reco loss",
+         f"⟨AE loss⟩ vs {axis2_label} (by class)", "AE_vs_contrastive_by_class", axis2_log_scale),
+        (axis1_bkg, axis2_bkg, "AE reco loss", f"Mean {axis2_label}",
+         f"⟨{axis2_label}⟩ vs AE loss (by class)", "contrastive_vs_AE_by_class", True),
     ]:
         fig, ax = plt.subplots(figsize=fig_size)
         for cls, name in class_names.items():
             m = labels_masked == cls
             if m.sum() < 20:
                 continue
-            profile_plot(ax, x_arr[m], y_arr[m], nbins=40, logx=True, label=name)
+            profile_plot(ax, x_arr[m], y_arr[m], nbins=40, logx=logx_flag, label=name)
         ax.set_xlabel(xlabel, fontsize=fs); ax.set_ylabel(ylabel, fontsize=fs)
         ax.set_title(title); ax.legend(fontsize=fs_legend)
         plt.tick_params(axis="x", labelsize=fs_leg)
@@ -620,10 +732,10 @@ def ABCD(config):
 
     # 1D closure scan
     effs, closure_ratio, closure_unc = [], [], []
-    Ntot_bkg = float(len(axis1_qcd))
+    Ntot_bkg = float(gen_weights_qcd.sum()) if gen_weights_qcd is not None else float(len(axis1_qcd))
 
     for p in percent:
-        t1, t2, A, B, C, D = abcd_counts(axis1_qcd, axis2_qcd, p, p)
+        t1, t2, A, B, C, D = abcd_counts(axis1_qcd, axis2_qcd, p, p, weights=gen_weights_qcd)
         A_hat  = (B * C) / max(D, 1e-8)
         ratio  = A_hat / max(A, 1e-8)
         invA   = 0.0 if A == 0 else 1.0 / A
@@ -648,7 +760,7 @@ def ABCD(config):
     ratio_opt = best["A_hat"] / max(best["A"], 1e-8)
 
     fig, ax = plt.subplots(figsize=fig_size)
-    ax.plot(effs, closure_ratio, c="g", label="AE + NURD Contrastive (MD)")
+    ax.plot(effs, closure_ratio, c="g", label=f"AE + NURD Contrastive ({axis2_label})")
     ax.fill_between(effs, closure_ratio - closure_unc, closure_ratio + closure_unc,
                     facecolor="g", alpha=0.5, interpolate=True)
     ax.plot(effs, np.ones_like(effs),       linestyle="-",  color="black")
@@ -691,6 +803,10 @@ if __name__ == "__main__":
                         help="Path to test .pt file (SM cocktail)")
     parser.add_argument("--signal_pt",    default=None,
                         help="Optional signal .pt file")
+    parser.add_argument("--gen_weight_path", default=None,
+                        help="Path to per-event gen weights .pt (e.g. weight_test.pt). "
+                             "Must have same number of entries as --test_pt. "
+                             "Applied to QCD events only for weighted ABCD counts.")
     parser.add_argument("--outdir",       default="outputs_abcd")
     parser.add_argument("--min_A",        type=int, default=50)
     parser.add_argument("--min_D",        type=int, default=500)
@@ -705,5 +821,9 @@ if __name__ == "__main__":
     parser.add_argument("--skip_embedding_pca",  action="store_true")
     parser.add_argument("--min_md",              action="store_true",
                         help="Use min-MD across DY+QCD+WJets (labels 0,1,3) instead of QCD-only MD")
+    parser.add_argument("--axis2_logit",         action="store_true",
+                        help="Use 1-P(QCD) classifier score as axis 2 instead of Mahalanobis distance")
+    parser.add_argument("--qcd_label",           type=int, default=1,
+                        help="Class label index for QCD (used by logit mode)")
     args = parser.parse_args()
     ABCD(vars(args))

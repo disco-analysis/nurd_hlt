@@ -4,13 +4,40 @@ make_datacard_ttbar.py
 Produces a CMS Combine ABCD datacard for a ttbar signal search using the
 HLT NURD contrastive model.
 
-Axis 1 (x): AE reconstruction loss
-Axis 2 (y): Mahalanobis distance in PCA-whitened NURD latent space
-Signal: TT (label=2). Background: DY (0) + QCD (1) + WJets (3).
+Two discriminating axes:
+  Axis 1 (x): AE reconstruction loss  — measures how "surprising" an event is to the AE
+  Axis 2 (y): Mahalanobis distance in PCA-whitened NURD latent space
 
-Writes:
-  <outdir>/datacard_ttbar.txt  — CMS Combine ABCD datacard
-  <outdir>/abcd_summary.json   — ABCD counts and thresholds for bookkeeping
+ABCD regions (defined by thresholds t1, t2):
+
+         axis2 (MD)
+         ^
+  high   |   C     |   A (signal region)
+         |---------|----------
+  low    |   D     |   B
+         +---------|---------> axis1 (AE loss)
+                  t1
+
+Background prediction in A: N_bkg_A_hat = N_bkg_B * N_bkg_C / N_bkg_D
+Signal = TT events (label == 2 in the SM cocktail dataset)
+Background = DY (0) + QCD (1) + WJets (3)
+
+Thresholds are optimised on QCD-only events (same as eval_abcd_nurd.py).
+
+Usage:
+------
+python make_datacard_ttbar.py \\
+    --ckpt    /path/to/checkpoint_main.pth.tar \\
+    --ae_ckpt /path/to/checkpoint_ae.pth \\
+    --test_pt /path/to/hlt_smcocktail_test.pt \\
+    [--n_pca 6] \\
+    [--p1 0.90 --p2 0.90]  # explicit thresholds instead of scanning \\
+    [--outdir outputs_datacard] \\
+    [--datacard_name datacard_ttbar.txt]
+
+The script writes:
+  <outdir>/datacard_ttbar.txt   — CMS Combine ABCD datacard
+  <outdir>/abcd_summary.json    — all ABCD counts and thresholds for bookkeeping
 """
 
 import os
@@ -19,6 +46,9 @@ import json
 import argparse
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from models.hlt_con import HLTContrastiveModel
 from models.hlt_autoencoder import HLTAutoencoder
@@ -98,27 +128,43 @@ def compute_ae_scores(ae, ae_scaler, pt_path_or_dict, device, batch_size=4096):
     return torch.cat(scores).numpy().astype(np.float32), labels
 
 
-def embed_pf(model, pt_path_or_dict, device, batch_size=512):
-    """Returns (latents [N, D], labels [N])."""
+def embed_pf(model, pt_path_or_dict, device, batch_size=512, return_logits=False):
+    """Returns (latents [N, D], labels [N]) or (latents, logits [N, C], labels) if return_logits."""
     raw = torch.load(pt_path_or_dict, map_location="cpu") if isinstance(pt_path_or_dict, str) else pt_path_or_dict
     pf     = torch.nan_to_num(raw["pf"], nan=0.0, posinf=0.0, neginf=0.0)
     labels = raw["label"].numpy()
     N = pf.shape[0]
     print(f"  Encoder inference on {N} events...", flush=True)
 
-    latents = []
+    latents, logits_list = [], []
     with torch.no_grad():
         for i0 in range(0, N, batch_size):
             xb = pf[i0:i0 + batch_size].to(device)
-            latent, _ = model(xb)
+            latent, logit = model(xb)
             latents.append(latent.cpu())
+            if return_logits:
+                logits_list.append(logit.cpu())
+    if return_logits:
+        return (torch.cat(latents, dim=0).numpy(),
+                torch.cat(logits_list, dim=0).numpy(),
+                labels)
     return torch.cat(latents, dim=0).numpy(), labels
 
 
+def compute_logit_axis2(logits, qcd_label=1):
+    """1 - P(QCD) from classifier logits — higher means more anomalous."""
+    import torch.nn.functional as F_
+    probs = F_.softmax(torch.from_numpy(logits.astype(np.float32)), dim=1).numpy()
+    return (1.0 - probs[:, qcd_label]).astype(np.float32)
+
+
 def compute_md_scores(latents, labels, n_pca=None, bkg_labels=None):
-    """Fit PCA-whitened Gaussian to bkg_labels events, compute MD for all events."""
+    """
+    Fit PCA-whitened Gaussian to bkg_labels events, compute MD for all events.
+    Returns md [N].
+    """
     if bkg_labels is None:
-        bkg_labels = [1]
+        bkg_labels = [1]  # QCD by default
 
     _CLASS_NAMES = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
     class_transforms = []
@@ -148,25 +194,55 @@ def compute_md_scores(latents, labels, n_pca=None, bkg_labels=None):
 
 
 # ---------------------------------------------------------------------------
+# Cross-section weights: xsec (pb) * lumi (pb^-1) / n_gen
+#
+# Lumi: 172,398 pb^-1 (full Run 3, 2022-2024)
+# xsec: GenXSecAnalyzer on Run3Winter25 samples (QCD/TT confirmed directly;
+#        DY/WJet from PDG/CMS central values)
+# n_gen: total events GENERATED before any HLT/scouting filter, confirmed via
+#        DAS summary + independent per-file sum:
+#   QCD   — /QCD_Bin-Pt-15to7000_.../Run3Winter25.../MINIAODSIM  (dedicated 100k campaign)
+#   TT    — /TT_TuneCP5_.../Run3Winter25.../GEN-SIM-RAW          (dedicated 100k campaign)
+#   DY    — /DYto2L-4Jets_.../Run3Winter25.../GEN-SIM-RAW        (72M-event full production)
+#   WJet  — /WJetsToLNu_.../Run3Winter25.../GEN-SIM-RAW          (29M-event full production)
+# ---------------------------------------------------------------------------
+LUMI_PB = 172_398.0  # full Run 3, pb^-1
+_XSEC   = {0: 5_469.0, 1: 1.436e9, 2: 814.5, 3: 56_120.0}   # pb
+_N_GEN  = {0: 72_101_775, 1: 100_000, 2: 100_000, 3: 29_163_730}
+CLASS_WEIGHTS = {cls: _XSEC[cls] * LUMI_PB / _N_GEN[cls] for cls in _XSEC}
+# Resulting per-event weights: QCD ~2.48e9, TT ~1404, DY ~13.1, WJet ~332
+# QCD weight is large by construction — only 100k events represent a 1.4e9 pb process.
+
+
+def make_event_weights(labels, use_weights=True):
+    if not use_weights:
+        return np.ones(len(labels), dtype=np.float64)
+    return np.array([CLASS_WEIGHTS.get(int(l), 1.0) for l in labels], dtype=np.float64)
+
+
+# ---------------------------------------------------------------------------
 # ABCD helpers
 # ---------------------------------------------------------------------------
 
-def abcd_counts(ax1, ax2, t1, t2):
-    """Returns dict {A, B, C, D} with float event counts."""
+def abcd_counts(ax1, ax2, t1, t2, weights=None):
+    """Returns dict {A, B, C, D} with (weighted) event counts."""
+    if weights is None:
+        weights = np.ones(len(ax1), dtype=np.float64)
     return {
-        "A": float(((ax1 > t1) & (ax2 > t2)).sum()),
-        "B": float(((ax1 > t1) & (ax2 <= t2)).sum()),
-        "C": float(((ax1 <= t1) & (ax2 > t2)).sum()),
-        "D": float(((ax1 <= t1) & (ax2 <= t2)).sum()),
+        "A": float(weights[(ax1 > t1)  & (ax2 > t2)].sum()),
+        "B": float(weights[(ax1 > t1)  & (ax2 <= t2)].sum()),
+        "C": float(weights[(ax1 <= t1) & (ax2 > t2)].sum()),
+        "D": float(weights[(ax1 <= t1) & (ax2 <= t2)].sum()),
     }
 
 
 def find_best_abcd_wp(ae_qcd, md_qcd, min_A=10, min_D=100, n_scan=48):
-    """Scan percentile pairs and return (t1, t2, nonclosure) with minimum |nonclosure|."""
+    """Scan percentile pairs; return (best, nc_grid, percent) — nc_grid[i,j] = nonclosure."""
     percent = np.linspace(0.50, 0.98, n_scan)
     best = {"nonclosure": np.inf}
-    for p1 in percent:
-        for p2 in percent:
+    nc_grid = np.full((len(percent), len(percent)), np.nan)
+    for i, p1 in enumerate(percent):
+        for j, p2 in enumerate(percent):
             t1_ = float(np.quantile(ae_qcd, p1))
             t2_ = float(np.quantile(md_qcd, p2))
             A = int(((ae_qcd > t1_) & (md_qcd > t2_)).sum())
@@ -177,12 +253,92 @@ def find_best_abcd_wp(ae_qcd, md_qcd, min_A=10, min_D=100, n_scan=48):
                 continue
             A_hat = (B * C) / max(D, 1e-8)
             nc    = (A - A_hat) / max(A_hat, 1e-8)
+            nc_grid[i, j] = nc
             if np.isfinite(nc) and abs(nc) < abs(best["nonclosure"]):
                 best.update({"nonclosure": nc, "t1": t1_, "t2": t2_,
                              "p1": p1, "p2": p2, "A": A, "B": B, "C": C, "D": D})
     if "t1" not in best:
         raise RuntimeError("No ABCD working point found. Try lowering --min_A / --min_D.")
-    return best
+    return best, nc_grid, percent
+
+
+# ---------------------------------------------------------------------------
+# Closure plots
+# ---------------------------------------------------------------------------
+
+def plot_closure_scans(ae_qcd, md_qcd, best, nc_grid, percent, outdir,
+                       axis2_label="MD"):
+    """Save 2D and 1D ABCD closure scan plots."""
+    # 2D: full (p1, p2) grid coloured by |non-closure|
+    fig, ax = plt.subplots(figsize=(7.5, 6.5))
+    pct_abs = np.clip(np.abs(nc_grid) * 100.0, 0.0, 100.0)
+    vmax = float(np.nanpercentile(pct_abs, 95)) if np.any(np.isfinite(pct_abs)) else 100.0
+    mesh = ax.pcolormesh(percent, percent, pct_abs.T, cmap="viridis_r",
+                         vmin=0.0, vmax=vmax, shading="auto")
+    cb = fig.colorbar(mesh, ax=ax)
+    cb.set_label("|Non-closure| (%)", fontsize=14)
+    ax.scatter([best["p1"]], [best["p2"]], marker="*", s=400, color="red",
+               edgecolor="black", linewidth=1.0, zorder=5,
+               label=f"Best: p1={best['p1']:.3f}, p2={best['p2']:.3f}\n"
+                     f"|NC|={100.0*abs(best['nonclosure']):.2f}%")
+    ax.set_xlabel("Percentile threshold — axis 1 (AE reco loss)", fontsize=13)
+    ax.set_ylabel(f"Percentile threshold — axis 2 ({axis2_label})", fontsize=13)
+    ax.set_title("ABCD closure scan (QCD)", fontsize=14)
+    ax.legend(loc="lower left", fontsize=11, framealpha=0.9)
+    fig.tight_layout()
+    out2d = os.path.join(outdir, "closure_scan_2d.png")
+    fig.savefig(out2d, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Closure 2D scan saved: {out2d}")
+
+    # 1D: equal-percentile cut (p1=p2=p) swept from loose to tight
+    pvals = np.linspace(0.10, 0.98, 60)
+    Ntot  = float(len(ae_qcd))
+    effs, ratios, uncs = [], [], []
+    for p in pvals:
+        t1_ = float(np.quantile(ae_qcd, p))
+        t2_ = float(np.quantile(md_qcd, p))
+        A = int(((ae_qcd > t1_) & (md_qcd > t2_)).sum())
+        B = int(((ae_qcd > t1_) & (md_qcd <= t2_)).sum())
+        C = int(((ae_qcd <= t1_) & (md_qcd > t2_)).sum())
+        D = int(((ae_qcd <= t1_) & (md_qcd <= t2_)).sum())
+        A_hat = (B * C) / max(D, 1e-8)
+        ratio = A_hat / max(A, 1e-8)
+        sigma = abs(ratio) * np.sqrt(
+            (0.0 if A == 0 else 1.0 / A) + (0.0 if B == 0 else 1.0 / B) +
+            (0.0 if C == 0 else 1.0 / C) + (0.0 if D == 0 else 1.0 / D)
+        )
+        effs.append(A / max(Ntot, 1.0))
+        ratios.append(ratio)
+        uncs.append(sigma)
+
+    effs   = np.array(effs);  ratios = np.array(ratios);  uncs = np.array(uncs)
+    order  = np.argsort(effs)
+    effs   = effs[order];   ratios = ratios[order];   uncs = uncs[order]
+    A_hat_opt = best["B"] * best["C"] / max(best["D"], 1e-8)
+    eff_opt   = best["A"] / max(Ntot, 1.0)
+    ratio_opt = A_hat_opt / max(best["A"], 1e-8)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(effs, ratios, c="steelblue", label="Predicted / true (equal-pct cut)")
+    ax.fill_between(effs, ratios - uncs, ratios + uncs,
+                    facecolor="steelblue", alpha=0.35, interpolate=True)
+    ax.axhline(1.00, color="black", linestyle="-",  linewidth=1.0)
+    ax.axhline(0.95, color="black", linestyle="--", linewidth=1.0, alpha=0.6)
+    ax.axhline(1.05, color="black", linestyle="--", linewidth=1.0, alpha=0.6)
+    ax.scatter([eff_opt], [ratio_opt], marker="*", s=250, c="red", zorder=5,
+               label=f"Optimized WP ({100.0*abs(best['nonclosure']):.1f}% NC)")
+    ax.set_xlabel("Selection efficiency (QCD in A / total QCD)", fontsize=14)
+    ax.set_ylabel("Predicted bkg. / true bkg.", fontsize=14)
+    ax.set_ylim(0.0, 1.5)
+    ax.set_xscale("log")
+    ax.legend(loc="lower right", fontsize=12)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    out1d = os.path.join(outdir, "closure_scan_1d.png")
+    fig.savefig(out1d, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Closure 1D scan saved: {out1d}")
 
 
 # ---------------------------------------------------------------------------
@@ -191,71 +347,90 @@ def find_best_abcd_wp(ae_qcd, md_qcd, min_A=10, min_D=100, n_scan=48):
 
 def write_datacard(
     path,
-    bins_sig,        # {"A":..., "B":..., "C":..., "D":...} — TT event counts
-    bins_bkg,        # same but for background
-    bins_obs,        # same but total (sig+bkg) — what you'd observe in data
-    nonclosure,      # float, from background-only: (A_true - A_hat) / A_hat
-    bkg_process_desc="QCD (label=1)",
+    bins_sig,
+    bins_bkg,
+    bins_obs,
+    nonclosure=None,
+    bkg_process_desc=None,
     signal_name="tt",
     bkg_name="bkg",
-    sig_unc=0.05,    # flat signal systematic (5%)
-    lumi_unc=0.016,  # luminosity uncertainty (1.6%, CMS Run 2)
+    sig_unc=None,
+    lumi_unc=None,
 ):
-    """Write a CMS Combine ABCD datacard using rateParam."""
     N_bkg_B = max(bins_bkg["B"], 1e-3)
     N_bkg_C = max(bins_bkg["C"], 1e-3)
     N_bkg_D = max(bins_bkg["D"], 1e-3)
-    N_bkg_A_hat = N_bkg_B * N_bkg_C / N_bkg_D
 
-    sig_A = max(bins_sig["A"], 1e-5)
-    sig_B = max(bins_sig["B"], 1e-5)
-    sig_C = max(bins_sig["C"], 1e-5)
-    sig_D = max(bins_sig["D"], 1e-5)
+    def fmt(x): return f"{x:.4f}"
 
     obs_A = int(round(bins_obs["A"]))
     obs_B = int(round(bins_obs["B"]))
     obs_C = int(round(bins_obs["C"]))
     obs_D = int(round(bins_obs["D"]))
 
-    nc_lnN = 1.0 + abs(nonclosure)
-
-    def fmt(x): return f"{x:.4f}"
-
     lines = [
-        "imax 4  # number of channels (one per ABCD region)",
-        "jmax 1  # one background process",
-        "kmax *",
-        "",
-        60 * "-",
-        "",
-        f"bin          A        B        C        D",
+        "imax 4", "jmax 1", "kmax 0", "",
+        60 * "-", "",
+        "bin          A        B        C        D",
         f"observation  {obs_A:<8d} {obs_B:<8d} {obs_C:<8d} {obs_D:<8d}",
-        "",
-        60 * "-",
-        "",
+        "", 60 * "-", "",
         f"bin      {'A':<10} {'B':<10} {'C':<10} {'D':<10} {'A':<10} {'B':<10} {'C':<10} {'D':<10}",
         f"process  {signal_name:<10} {signal_name:<10} {signal_name:<10} {signal_name:<10} "
         f"{bkg_name:<10} {bkg_name:<10} {bkg_name:<10} {bkg_name:<10}",
         f"process  {'0':<10} {'0':<10} {'0':<10} {'0':<10} "
         f"{'1':<10} {'1':<10} {'1':<10} {'1':<10}",
-        f"rate     {fmt(sig_A):<10} {fmt(sig_B):<10} {fmt(sig_C):<10} {fmt(sig_D):<10} "
-        f"{'1':<10} {fmt(N_bkg_B):<10} {fmt(N_bkg_C):<10} {fmt(N_bkg_D):<10}",
-        "",
-        60 * "-",
-        "",
-        f"lumi          lnN   {1+lumi_unc:.4f}  {1+lumi_unc:.4f}  {1+lumi_unc:.4f}  {1+lumi_unc:.4f}  -  -  -  -",
-        f"sig_acc       lnN   {1+sig_unc:.4f}  {1+sig_unc:.4f}  {1+sig_unc:.4f}  {1+sig_unc:.4f}  -  -  -  -",
-        f"abcd_nonclosure  lnN  -  -  -  -  {nc_lnN:.4f}  -  -  -",
-        "",
-        f"r_B   rateParam  B  {bkg_name}  {fmt(N_bkg_B)}  [0,{N_bkg_B*20:.2f}]",
-        f"r_C   rateParam  C  {bkg_name}  {fmt(N_bkg_C)}  [0,{N_bkg_C*20:.2f}]",
-        f"r_D   rateParam  D  {bkg_name}  {fmt(N_bkg_D)}  [0,{N_bkg_D*20:.2f}]",
+        f"rate     {fmt(bins_sig['A']):<10} {fmt(bins_sig['B']):<10} "
+        f"{fmt(bins_sig['C']):<10} {fmt(bins_sig['D']):<10} "
+        f"{'1':<10} {'1':<10} {'1':<10} {'1':<10}",
+        "", 60 * "-", "",
+        f"r_B   rateParam  B  {bkg_name}  {fmt(N_bkg_B)}",
+        f"r_C   rateParam  C  {bkg_name}  {fmt(N_bkg_C)}",
+        f"r_D   rateParam  D  {bkg_name}  {fmt(N_bkg_D)}",
         f"r_A   rateParam  A  {bkg_name}  @0*@1/@2  r_B,r_C,r_D",
     ]
 
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"Datacard written to: {path}")
+
+
+def write_datacard_cnt(
+    path,
+    sig_A,
+    bkg_A,
+    obs_A,
+    signal_name="tt",
+    bkg_name="bkg",
+):
+    """
+    Write a single-bin cut-and-count datacard for the signal region A only.
+    Background rate comes directly from MC — no rateParam transfer factor.
+    """
+    def fmt(x): return f"{x:.4f}"
+
+    lines = [
+        "imax 1",
+        "jmax 1",
+        "kmax 0",
+        "",
+        60 * "-",
+        "",
+        f"bin          A",
+        f"observation  {int(round(obs_A))}",
+        "",
+        60 * "-",
+        "",
+        f"bin      {'A':<10} {'A':<10}",
+        f"process  {signal_name:<10} {bkg_name:<10}",
+        f"process  {'0':<10} {'1':<10}",
+        f"rate     {fmt(sig_A):<10} {fmt(bkg_A):<10}",
+        "",
+        60 * "-",
+    ]
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"Cut-and-count datacard written to: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -276,18 +451,23 @@ def main():
     parser.add_argument("--tt_label",          type=int,   default=2,     help="Class label for TT (default: 2)")
     parser.add_argument("--bkg_process_labels", type=int, nargs="+", default=[1],
                         help="Which labels count as background in ABCD (default: 1=QCD only). "
+                             "Events with other labels are excluded from the analysis entirely. "
                              "Example: --bkg_process_labels 0 1 3  includes DY+QCD+WJets.")
     parser.add_argument("--bkg_labels", type=int, nargs="+", default=[1],
                         help="Labels to use when fitting the MD Gaussian (default: 1=QCD). "
                              "Should be a subset of --bkg_process_labels.")
     parser.add_argument("--min_md",     action="store_true",
                         help="Use min-MD across bkg_labels instead of QCD-only")
+    parser.add_argument("--axis2_logit", action="store_true",
+                        help="Use 1-P(QCD) classifier score as axis2 instead of Mahalanobis distance")
     parser.add_argument("--min_A",      type=int,   default=10,    help="Min QCD events in A for WP scan")
     parser.add_argument("--min_D",      type=int,   default=100,   help="Min QCD events in D for WP scan")
     parser.add_argument("--outdir",     default="outputs_datacard", help="Output directory")
     parser.add_argument("--datacard_name", default="datacard_ttbar.txt")
     parser.add_argument("--sig_unc",    type=float, default=0.05,  help="Signal systematic (flat fraction)")
     parser.add_argument("--lumi_unc",   type=float, default=0.016, help="Lumi uncertainty (fraction)")
+    parser.add_argument("--no_xsec_weights", action="store_true",
+                        help="Disable xsec*lumi/nevents weighting (use raw event counts)")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -298,7 +478,7 @@ def main():
     if args.eval_json is not None:
         with open(args.eval_json) as f:
             eval_thresholds = json.load(f)
-        args.p1   = None
+        args.p1   = None  # not used — we have absolute thresholds
         args.p2   = None
         _t1_fixed = eval_thresholds["t1"]
         _t2_fixed = eval_thresholds["t2"]
@@ -320,20 +500,26 @@ def main():
     del ae; gc.collect()
     if device == "cuda": torch.cuda.empty_cache()
 
-    # ── MD scores ─────────────────────────────────────────────────────────────
-    print("\n[3/4] Computing NURD MD scores...")
-    latents, _  = embed_pf(model, args.test_pt, device)
-    bkg_labels  = ([0, 1, 3] if args.min_md else args.bkg_labels)
-    md_scores   = compute_md_scores(latents, labels, n_pca=args.n_pca, bkg_labels=bkg_labels)
+    # ── axis2 scores (MD or logit) ────────────────────────────────────────────
+    axis2_label = "1-P(QCD)" if args.axis2_logit else "MD"
+    print(f"\n[3/4] Computing axis2 scores ({axis2_label})...")
+    bkg_labels = None
+    if args.axis2_logit:
+        _, logits_arr, _ = embed_pf(model, args.test_pt, device, return_logits=True)
+        axis2_scores = compute_logit_axis2(logits_arr, qcd_label=1)
+    else:
+        latents, _  = embed_pf(model, args.test_pt, device)
+        bkg_labels  = ([0, 1, 3] if args.min_md else args.bkg_labels)
+        axis2_scores = compute_md_scores(latents, labels, n_pca=args.n_pca, bkg_labels=bkg_labels)
 
     # ── valid event mask ──────────────────────────────────────────────────────
     CLASS_NAMES = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
     keep_labels = set(args.bkg_process_labels) | {args.tt_label}
     process_mask = np.isin(labels, list(keep_labels))
-    mask = np.isfinite(ae_scores) & np.isfinite(md_scores) & (ae_scores > 0) & process_mask
-    ae_scores = ae_scores[mask]
-    md_scores = md_scores[mask]
-    labels    = labels[mask]
+    mask = np.isfinite(ae_scores) & np.isfinite(axis2_scores) & (ae_scores > 0) & process_mask
+    ae_scores    = ae_scores[mask]
+    axis2_scores = axis2_scores[mask]
+    labels       = labels[mask]
     print(f"Valid events after masking (keeping labels {sorted(keep_labels)}): {mask.sum()}")
 
     # ── split by process ──────────────────────────────────────────────────────
@@ -349,8 +535,15 @@ def main():
         role = "SIGNAL" if cls == args.tt_label else "background"
         print(f"  {name} (label={cls}): {(labels==cls).sum()}  [{role}]")
 
-    ae_sig, md_sig = ae_scores[sig_mask], md_scores[sig_mask]
-    ae_bkg, md_bkg = ae_scores[bkg_mask], md_scores[bkg_mask]
+    ae_sig, md_sig = ae_scores[sig_mask], axis2_scores[sig_mask]
+    ae_bkg, md_bkg = ae_scores[bkg_mask], axis2_scores[bkg_mask]
+
+    use_weights = not args.no_xsec_weights
+    event_weights = make_event_weights(labels, use_weights)
+    if use_weights:
+        print(f"\nxsec weights: { {k: f'{v:.3g}' for k,v in CLASS_WEIGHTS.items()} }")
+    sig_weights = event_weights[sig_mask]
+    bkg_weights = event_weights[bkg_mask]
 
     # ── find ABCD thresholds ──────────────────────────────────────────────────
     print("\n[4/4] Finding ABCD working point...")
@@ -359,30 +552,34 @@ def main():
         raise RuntimeError("No QCD events found after filtering. Check --bkg_process_labels.")
 
     if _t1_fixed is not None:
+        # Use thresholds loaded from eval_abcd_nurd.py JSON — skip scan entirely
         t1, t2 = _t1_fixed, _t2_fixed
         nonclosure_qcd = None
         print(f"Using thresholds from eval JSON: t1={t1:.4g}, t2={t2:.4g}")
     elif args.p1 is not None and args.p2 is not None:
         t1 = float(np.quantile(ae_scores[qcd_mask_all], args.p1))
-        t2 = float(np.quantile(md_scores[qcd_mask_all], args.p2))
+        t2 = float(np.quantile(axis2_scores[qcd_mask_all], args.p2))
         nonclosure_qcd = None
         print(f"Using specified percentiles: p1={args.p1}, p2={args.p2}")
         print(f"Thresholds: t1={t1:.4g}, t2={t2:.4g}")
     else:
+        # Scan on QCD-only (same as eval_abcd_nurd.py)
         ae_qcd = ae_scores[qcd_mask_all]
-        md_qcd = md_scores[qcd_mask_all]
-        wp = find_best_abcd_wp(ae_qcd, md_qcd, min_A=args.min_A, min_D=args.min_D)
+        md_qcd = axis2_scores[qcd_mask_all]
+        wp, nc_grid, percent = find_best_abcd_wp(ae_qcd, md_qcd, min_A=args.min_A, min_D=args.min_D)
         t1, t2 = wp["t1"], wp["t2"]
         nonclosure_qcd = wp["nonclosure"]
         print(f"Best WP: p1={wp['p1']:.3f}, p2={wp['p2']:.3f}")
         print(f"Thresholds: t1={t1:.4g}, t2={t2:.4g}")
         print(f"QCD ABCD: A={wp['A']}  B={wp['B']}  C={wp['C']}  D={wp['D']}")
         print(f"QCD nonclosure: {100*nonclosure_qcd:.2f}%")
+        plot_closure_scans(ae_qcd, md_qcd, wp, nc_grid, percent,
+                           outdir=args.outdir, axis2_label="NURD contrastive MD")
 
     # ── ABCD counts ──────────────────────────────────────────────────────────
-    bins_sig = abcd_counts(ae_sig, md_sig, t1, t2)
-    bins_bkg = abcd_counts(ae_bkg, md_bkg, t1, t2)
-    bins_obs = abcd_counts(ae_scores, md_scores, t1, t2)
+    bins_sig = abcd_counts(ae_sig, md_sig, t1, t2, weights=sig_weights)
+    bins_bkg = abcd_counts(ae_bkg, md_bkg, t1, t2, weights=bkg_weights)
+    bins_obs = abcd_counts(ae_scores, axis2_scores, t1, t2, weights=event_weights)
 
     bkg_A_hat    = bins_bkg["B"] * bins_bkg["C"] / max(bins_bkg["D"], 1e-8)
     nonclosure_bkg = (bins_bkg["A"] - bkg_A_hat) / max(bkg_A_hat, 1e-8)
@@ -402,9 +599,10 @@ def main():
     print(f"Signal / background in A       : {bins_sig['A']/max(bkg_A_hat,1e-8):.3f}")
     print()
 
+    # Use the larger of the two nonclosure estimates as the systematic
     nc_for_card = max(abs(nonclosure_bkg), abs(nonclosure_qcd) if nonclosure_qcd else 0)
 
-    # ── write datacard ────────────────────────────────────────────────────────
+    # ── write datacards ───────────────────────────────────────────────────────
     card_path = os.path.join(args.outdir, args.datacard_name)
     write_datacard(
         card_path,
@@ -417,12 +615,24 @@ def main():
         lumi_unc=args.lumi_unc,
     )
 
+    cnt_name = args.datacard_name.replace(".txt", "_cnt.txt")
+    write_datacard_cnt(
+        os.path.join(args.outdir, cnt_name),
+        sig_A=bins_sig["A"],
+        bkg_A=bins_bkg["A"],
+        obs_A=bins_obs["A"],
+    )
+
     # ── save summary JSON ─────────────────────────────────────────────────────
     summary = {
+        "ckpt": args.ckpt,
+        "ae_ckpt": args.ae_ckpt,
+        "test_pt": args.test_pt,
         "thresholds": {"t1": float(t1), "t2": float(t2)},
         "n_pca": args.n_pca,
+        "axis2_mode": "logit" if args.axis2_logit else "md",
         "bkg_process_labels": args.bkg_process_labels,
-        "bkg_labels_for_md": bkg_labels,
+        "bkg_labels_for_md": (None if args.axis2_logit else bkg_labels),
         "tt_label": args.tt_label,
         "bins_signal": bins_sig,
         "bins_background": bins_bkg,

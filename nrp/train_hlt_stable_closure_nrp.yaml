@@ -8,10 +8,6 @@ spec:
   template:
     spec:
       restartPolicy: Never
-      tolerations:
-        - key: "nautilus.io/issue"
-          operator: "Exists"
-          effect: "NoSchedule"
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -62,13 +58,13 @@ spec:
                 --linear_dim   16 \
                 --critic_type              density_ratio \
                 --critic_schedule          warmup \
-                --critic_warmup_epochs     20 \
+                --critic_warmup_epochs     7 \
                 --critic_ramp_epochs       10 \
                 --critic_train_frac        0.5 \
                 --critic_lr_multiplier     10.0 \
                 --n_critic_steps_per_batch 3 \
                 --_lambda      1.0 \
-                --closure_weight       0.5 \
+                --closure_weight       1.0 \
                 --closure_n_cuts       50 \
                 --closure_sigmoid_scale 12.0 \
                 --qcd_label      1 \

@@ -45,17 +45,18 @@ def _make_nurd_weights(labels, nuisances, max_weight_ratio=10.0):
 class HLTSmCocktailDataset(Dataset):
     """
     Args:
-        pf_data:    [N, max_cands, n_feats]  PF candidate features
-        obj_data:   [N, obj_feat_dim]        pre-normalised object-level AE inputs
-        labels:     [N] long
-        ae_model:   frozen pre-trained Autoencoder (eval mode)
-        n_bins:     number of quantile bins for the AE reco nuisance
-        split:      "train" | "val"
-        val_split:  fraction held out for validation
-        seed:       random seed for the train/val split
+        pf_data:      [N, max_cands, n_feats]  PF candidate features
+        obj_data:     [N, obj_feat_dim]        pre-normalised object-level AE inputs
+        labels:       [N] long
+        ae_model:     frozen pre-trained Autoencoder (eval mode)
+        n_bins:       number of quantile bins for the AE reco nuisance
+        split:        "train" | "val"
+        val_split:    fraction held out for validation
+        seed:         random seed for the train/val split
+        gen_weights:  [N] float per-event physics weights (genWeight × scale for QCD, 1.0 otherwise)
     """
     def __init__(self, pf_data, obj_data, labels, ae_model, n_bins=10,
-                 split="train", val_split=0.1, seed=42, bin_edges=None):
+                 split="train", val_split=0.1, seed=42, bin_edges=None, gen_weights=None):
         super().__init__()
 
         # ── compute AE reco loss per event ────────────────────────────────────
@@ -87,12 +88,13 @@ class HLTSmCocktailDataset(Dataset):
         idx = idx_tr if split == "train" else idx_val
         idx = torch.tensor(idx, dtype=torch.long)
 
-        self.features  = pf_data[idx]
-        self.obj       = obj_data[idx]
-        self.labels    = labels[idx].float()
-        self.nuisances = nuisances_all[idx].float()
-        self.ae_reco   = ae_reco_all[idx].float()
-        self.split     = split
+        self.features     = pf_data[idx]
+        self.obj          = obj_data[idx]
+        self.labels       = labels[idx].float()
+        self.nuisances    = nuisances_all[idx].float()
+        self.ae_reco      = ae_reco_all[idx].float()
+        self.gen_weights  = gen_weights[idx].float() if gen_weights is not None else None
+        self.split        = split
 
         # ── NURD exact weights ────────────────────────────────────────────────
         self.weights = _make_nurd_weights(labels[idx], nuisances_all[idx])
@@ -107,7 +109,10 @@ class HLTSmCocktailDataset(Dataset):
         return len(self.features)
 
     def __getitem__(self, idx):
-        return self.features[idx], self.labels[idx], self.nuisances[idx], self.ae_reco[idx]
+        out = (self.features[idx], self.labels[idx], self.nuisances[idx], self.ae_reco[idx])
+        if self.gen_weights is not None:
+            out += (self.gen_weights[idx],)
+        return out
 
     def get_label_prior(self):
         total = len(self.labels)
@@ -120,11 +125,14 @@ class HLTSmCocktailDataset(Dataset):
         return {k: v / total for k, v in counts.items()}
 
 
-def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42, max_events=-1):
+def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42, max_events=-1, exclude_labels=None, gen_weight_path=None, gen_weight_clip=None, qcd_label=1):
     """
     Load the HLT .pt file, pre-normalise obj features, and return
     (train_dataset, val_dataset).  Call once; pass the same bin_edges
     to both splits so nuisance definitions are consistent.
+
+    exclude_labels: list of integer labels to drop before training (e.g. [2] to drop TTBar).
+    Remaining labels are remapped to be contiguous starting from 0.
     """
     raw = torch.load(pt_path, map_location="cpu")
     pf     = raw["pf"]
@@ -133,6 +141,33 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42, max
     if max_events > 0:
         pf, labels, obj = pf[:max_events], labels[:max_events], obj[:max_events]
     pf = torch.nan_to_num(pf, nan=0.0, posinf=0.0, neginf=0.0)
+
+    gen_weights = None
+    if gen_weight_path is not None:
+        gen_weights = torch.load(gen_weight_path, map_location="cpu").float()
+        if max_events > 0:
+            gen_weights = gen_weights[:max_events]
+        if gen_weight_clip is not None:
+            qcd_mask = (labels == qcd_label)
+            qcd_mean = gen_weights[qcd_mask].mean()
+            gen_weights = gen_weights / qcd_mean
+            gen_weights = torch.clamp(gen_weights, max=gen_weight_clip)
+            print(f"[gen_weight_clip={gen_weight_clip}] QCD mean before clip: {qcd_mean:.3e}  "
+                  f"After clip: min={gen_weights[qcd_mask].min():.3e} "
+                  f"max={gen_weights[qcd_mask].max():.3e} "
+                  f"mean={gen_weights[qcd_mask].mean():.3f}")
+
+    if exclude_labels:
+        mask = torch.ones(len(labels), dtype=torch.bool)
+        for lbl in exclude_labels:
+            mask &= (labels != lbl)
+        pf, labels, obj = pf[mask], labels[mask], obj[mask]
+        if gen_weights is not None:
+            gen_weights = gen_weights[mask]
+        unique_lbls = sorted(labels.unique().tolist())
+        remap = {old: new for new, old in enumerate(unique_lbls)}
+        labels = torch.tensor([remap[l.item()] for l in labels], dtype=torch.long)
+        print(f"[exclude_labels={exclude_labels}] Remapped labels: {remap}. Remaining events: {len(labels)}")
 
     # flatten + z-score normalise obj features (first 4 features per cand)
     obj_flat = obj[:, :, :4].reshape(obj.shape[0], -1).float().numpy()
@@ -145,9 +180,11 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42, max
     # build train split first to get bin_edges from training data
     ds_train = HLTSmCocktailDataset(pf, obj_norm, labels, ae_model,
                                     n_bins=n_bins, split="train",
-                                    val_split=val_split, seed=seed)
+                                    val_split=val_split, seed=seed,
+                                    gen_weights=gen_weights)
     ds_val   = HLTSmCocktailDataset(pf, obj_norm, labels, ae_model,
                                     n_bins=n_bins, split="val",
                                     val_split=val_split, seed=seed,
-                                    bin_edges=ds_train.bin_edges)
+                                    bin_edges=ds_train.bin_edges,
+                                    gen_weights=gen_weights)
     return ds_train, ds_val, obj_scaler

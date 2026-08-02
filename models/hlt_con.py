@@ -206,10 +206,12 @@ class HLTContrastiveModel(nn.Module):
 
 class HLTCritic(nn.Module):
     """
-    Two modes:
-      bin_pred    (default): predicts nuisance bin from (latent, y) — [B, n_bins]
-      density_ratio         : classifies real vs shuffled-z from (latent, y, z) — [B, 2]
-                              matches gabhijith's original density-ratio trick
+    Four modes (--critic_type):
+      bin_pred    (default): predicts discrete AE bin from (latent, y) — [B, n_bins]
+      ae_regress           : regresses continuous AE reco score from (latent, y) — [B]
+      density_ratio        : classifies real vs shuffled-z from (latent, y, z) — [B, 2]
+      md_bin_pred          : predicts AE bin from scalar Mahalanobis distance instead of
+                             raw latent — use with --critic_on_md 1 in train_hlt.py
     """
     def __init__(self, latent_dim: int, num_classes: int, n_bins: int,
                  hidden: int = 128, critic_type: str = "bin_pred"):
@@ -221,12 +223,39 @@ class HLTCritic(nn.Module):
             self.net = nn.Sequential(
                 nn.Linear(latent_dim + 16 + 8, hidden), nn.ReLU(),
                 nn.Linear(hidden, hidden),               nn.ReLU(),
-                nn.Linear(hidden, 2),                    # binary: real=1 / shuffled=0
+                nn.Linear(hidden, 2),
             )
-        else:
+        elif critic_type == "ae_regress":
             self.net = nn.Sequential(
-                nn.Linear(latent_dim + 16, hidden), nn.ReLU(),
-                nn.Linear(hidden, hidden),          nn.ReLU(),
+                nn.Linear(latent_dim * 2 + 1 + 16, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden),                    nn.ReLU(),
+                nn.Linear(hidden, hidden),                    nn.ReLU(),
+                nn.Linear(hidden, 1),
+            )
+        elif critic_type == "md_bin_pred":
+            # input is scalar MD + class embedding — much easier than 6D latent
+            self.net = nn.Sequential(
+                nn.Linear(1 + 16, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden), nn.ReLU(),
+                nn.Linear(hidden, n_bins),
+            )
+        elif critic_type == "aug_bin_pred":
+            # bin_pred augmented with batch-level proxy MD as an extra feature.
+            # MD encodes the covariance-level latent-AE correlation that a pointwise
+            # critic misses; the gradient then flows back through MD -> latent -> encoder.
+            # input = [latent, latent^2, ||latent||, MD, y_emb]
+            self.net = nn.Sequential(
+                nn.Linear(latent_dim * 2 + 2 + 16, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden),                    nn.ReLU(),
+                nn.Linear(hidden, hidden),                    nn.ReLU(),
+                nn.Linear(hidden, n_bins),
+            )
+        else:  # bin_pred
+            self.net = nn.Sequential(
+                nn.Linear(latent_dim * 2 + 1 + 16, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden),                    nn.ReLU(),
+                nn.Linear(hidden, hidden),                    nn.ReLU(),
                 nn.Linear(hidden, n_bins),
             )
 
@@ -236,4 +265,20 @@ class HLTCritic(nn.Module):
         if self.critic_type == "density_ratio":
             z_emb = self.z_embed(z.long())                     # [B, 8]
             return self.net(torch.cat([rx, y_emb, z_emb], dim=1))
-        return self.net(torch.cat([rx, y_emb], dim=1))
+        if self.critic_type == "md_bin_pred":
+            # rx is scalar MD [B] — view as [B, 1]
+            md = rx.view(-1, 1).float()
+            return self.net(torch.cat([md, y_emb], dim=1))    # [B, n_bins]
+        if self.critic_type == "aug_bin_pred":
+            # rx is [B, latent_dim+1]: last column is the proxy MD
+            rx_lat  = rx[:, :-1].float()                      # [B, latent_dim]
+            md_feat = rx[:, -1:].float()                      # [B, 1]
+            rx_sq   = rx_lat ** 2
+            rx_norm = rx_lat.norm(dim=1, keepdim=True)
+            return self.net(torch.cat([rx_lat, rx_sq, rx_norm, md_feat, y_emb], dim=1))
+        rx_sq   = rx ** 2                                      # [B, latent_dim]
+        rx_norm = rx.norm(dim=1, keepdim=True)                 # [B, 1]
+        out = self.net(torch.cat([rx, rx_sq, rx_norm, y_emb], dim=1))
+        if self.critic_type == "ae_regress":
+            return out.squeeze(1)                              # [B] scalar per sample
+        return out

@@ -43,7 +43,7 @@ class SupConLoss(nn.Module):
         self.T  = temperature
         self.Tb = base_temperature
 
-    def forward(self, features, labels):
+    def forward(self, features, labels, weights=None):
         features = features.float()
         if features.dim() < 3:
             features = features.unsqueeze(1)
@@ -68,7 +68,10 @@ class SupConLoss(nn.Module):
         n_pos       = mask.sum(1).clamp(min=1e-6)
         mean_lp_pos = (mask * log_prob).sum(1) / n_pos
         loss        = -(self.T / self.Tb) * mean_lp_pos
-        return loss.view(1, B).mean()
+        loss        = loss.view(1, B)
+        if weights is not None:
+            return (loss * weights.unsqueeze(0)).sum() / weights.sum()
+        return loss.mean()
 
 
 # ── ABCD closure loss helpers (ported from double DisCo) ─────────────────────
@@ -85,8 +88,14 @@ def _sigmoid_counts(var1, var2, cut1, cut2, weights, scale=50.0):
     return NA, NB, NC, ND
 
 
-def closure_loss_batch(var1, var2, weights, n_cuts=15, n_events_min=10, max_tries=20, scale=50.0):
-    """ABCD closure |NA*ND - NB*NC| / (NA*ND + NB*NC) averaged over random cuts."""
+def closure_loss_batch(var1, var2, weights, n_cuts=15, n_events_min=10, max_tries=20, scale=50.0,
+                       cut_min=0.0):
+    """ABCD closure |NA*ND - NB*NC| / (NA*ND + NB*NC) averaged over random cuts.
+
+    cut_min: lower bound for cut sampling in normalised [0,1] space.  Set to e.g. 0.7
+    to only sample tail cuts, which focuses gradient on the tight-cut regime where
+    closure tends to fail due to lack of batch-level statistics at loose cuts.
+    """
     v1 = var1.view(-1).float()
     v2 = var2.view(-1).float()
     w  = weights.view(-1).float()
@@ -99,8 +108,8 @@ def closure_loss_batch(var1, var2, weights, n_cuts=15, n_events_min=10, max_trie
     for _ in range(n_cuts):
         for _ in range(max_tries):
             with torch.no_grad():
-                c1 = np.random.uniform(0.0, 1.0)
-                c2 = np.random.uniform(0.0, 1.0)
+                c1 = np.random.uniform(cut_min, 1.0)
+                c2 = np.random.uniform(cut_min, 1.0)
             NA, NB, NC, ND = _sigmoid_counts(v1_n, v2_n, c1, c2, w, scale=scale)
             if all(v.item() > n_events_min for v in [NA, NB, NC, ND]):
                 break
@@ -127,6 +136,29 @@ def _proxy_md(latent, qcd_mask):
     return (z * z).sum(dim=1).to(latent.dtype)
 
 
+def compute_stable_md_transform(model, train_loader, device, qcd_label):
+    """One forward pass over all training QCD events; fit and return frozen (mu, W)."""
+    model.eval()
+    all_latents = []
+    with torch.no_grad():
+        for batch in train_loader:
+            inputs, targets = batch[0].to(device), batch[1].long().to(device)
+            lat, _ = model(inputs)
+            qcd_mask = targets == qcd_label
+            if qcd_mask.any():
+                all_latents.append(lat[qcd_mask].cpu().float())
+    model.train()
+    if not all_latents:
+        return None
+    lat = torch.cat(all_latents, dim=0)
+    mu = lat.mean(0)
+    c = lat - mu
+    cov = (c.T @ c) / lat.shape[0]
+    L, V = torch.linalg.eigh(cov)
+    W = V / L.clamp(min=1e-6).sqrt()
+    return mu.to(device), W.to(device)
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(description="HLT NURD contrastive training")
@@ -139,7 +171,7 @@ parser.add_argument("--n_bins",     default=10,     type=int, help="Nuisance bin
 parser.add_argument("--epochs",         default=100,    type=int)
 parser.add_argument("--reweight_epochs",default=0,      type=int)
 parser.add_argument("--critic_epochs",  default=2,      type=int)
-parser.add_argument("-b","--batch_size",default=2048,   type=int)
+parser.add_argument("-b","--batch_size",default=512,    type=int)
 parser.add_argument("--lr",             default=1e-4,   type=float)
 parser.add_argument("--weight_decay",   default=5e-3,   type=float)
 parser.add_argument("--cosine",         default=1,      type=int)
@@ -153,7 +185,7 @@ parser.add_argument("--marginal_indep", default=0,      type=int)
 parser.add_argument("--critic_restart", default=0,      type=int)
 parser.add_argument("--exact",          default=1,      type=int)
 # Contrastive loss
-parser.add_argument("--contrast_weight",default=0.05,   type=float)
+parser.add_argument("--contrast_weight",default=0.09,   type=float)
 parser.add_argument("--contrast_temp",  default=0.05,   type=float)
 # Model architecture
 parser.add_argument("--embed_size",     default=128,    type=int)
@@ -164,15 +196,18 @@ parser.add_argument("--num_layers",     default=4,      type=int)
 parser.add_argument("--dim_ff",         default=512,    type=int)
 parser.add_argument("--linear_dim",     default=16,     type=int)
 # Logging
-parser.add_argument("--exp_name",       default="hlt_nurd_run", type=str)
+parser.add_argument("--exp_name",       default="hlt_nurd_closure_smcocktail", type=str)
 parser.add_argument("--project_name",   default="hlt",          type=str)
 parser.add_argument("--log_name",       default="info.log",     type=str)
 parser.add_argument("--gpu_ids",        default="0",            type=str)
 parser.add_argument("--local_rank",     default=-1,             type=int)
-parser.add_argument("--manualSeed",     default=None,           type=int)
+parser.add_argument("--manualSeed",     default=42,             type=int)
 parser.add_argument("--local_testing",  default=0,              type=int)
 parser.add_argument("--max_events",     default=-1,             type=int)
-parser.add_argument("--critic_schedule", default="per_batch",   type=str,
+parser.add_argument("--exclude_labels", default=None,           type=int, nargs="+",
+                    help="Label indices to exclude from training (e.g. --exclude_labels 2 to drop TTBar). "
+                         "Remaining labels are remapped to be contiguous.")
+parser.add_argument("--critic_schedule", default="warmup",      type=str,
                     help="'per_batch' (exact, trains critic on full dataset each batch) "
                          "or 'per_epoch' (trains critic once per epoch)")
 parser.add_argument("--critic_type",    default="bin_pred",     type=str,
@@ -189,14 +224,47 @@ parser.add_argument("--critic_lr_multiplier",     default=10.0,  type=float,
                     help="LR multiplier for the critic optimizer relative to main model LR")
 parser.add_argument("--n_critic_steps_per_batch", default=3,     type=int,
                     help="Number of gradient steps to take on the critic per selected batch")
-parser.add_argument("--closure_weight",       default=0.0,   type=float,
+parser.add_argument("--closure_weight",       default=0.1,   type=float,
                     help="Weight on ABCD closure loss (0 = disabled). Uses batch-level MD as axis 2.")
+parser.add_argument("--closure_n_cuts",       default=15,    type=int,
+                    help="Number of random ABCD cut pairs per batch in closure loss")
+parser.add_argument("--closure_sigmoid_scale", default=50.0, type=float,
+                    help="Sigmoid sharpness in closure loss; lower = softer region boundaries")
+parser.add_argument("--closure_cut_min",      default=0.0,  type=float,
+                    help="Lower bound for cut sampling in closure loss (normalised [0,1] space). "
+                         "Set to e.g. 0.7 to only sample tail cuts and focus gradient on the "
+                         "tight-cut regime where closure typically fails.")
+parser.add_argument("--stable_closure_md",    default=0,     type=int,
+                    help="If 1, fit QCD covariance once per epoch on full train set for a stable "
+                         "MD proxy in closure loss instead of the noisy batch-level estimate")
+parser.add_argument("--closure_on_logits",    default=0,     type=int,
+                    help="If 1, use 1-P(QCD) classifier score as axis2 in closure loss — "
+                         "directly differentiable, no MD proxy needed")
+parser.add_argument("--gen_weight_path",      default=None,  type=str,
+                    help="Path to per-event gen-weight tensor (.pt, shape [N]). "
+                         "Applied multiplicatively on top of NURD weights.")
+parser.add_argument("--gen_weight_clip",      default=None,  type=float,
+                    help="If set, normalize gen weights to mean=1 then clamp at this value "
+                         "before training. Reduces weight variance from extreme MEquiNNa factors.")
 parser.add_argument("--qcd_label",            default=1,     type=int,
                     help="Label index for QCD (used as reference class for MD and closure)")
-parser.add_argument("--no_mi_norm",           action="store_true",
+parser.add_argument("--no_mi_norm",           default=1,      type=int,
                     help="Skip per-batch normalization of MI penalty (divide by batch mean). "
                          "Without this, lambda is effectively rescaled by ~1/raw_mi, making "
                          "different lambda values produce near-identical gradients.")
+parser.add_argument("--critic_on_md",         default=0,      type=int,
+                    help="If 1, adversarially decorrelate Mahalanobis distance (scalar) vs "
+                         "AE loss instead of raw latent. Uses md_bin_pred critic type internally.")
+parser.add_argument("--critic_aug_md",        default=0,      type=int,
+                    help="If 1, augment the bin_pred critic input with the batch-level proxy MD. "
+                         "Lets the critic detect covariance-level latent-AE correlations that a "
+                         "pointwise critic misses. Uses aug_bin_pred critic type internally.")
+parser.add_argument("--encoder_ckpt",         default="",     type=str,
+                    help="Path to a pretrained main-model checkpoint (.pth.tar) to warm-start "
+                         "the encoder. Loads state_dict_model key.")
+parser.add_argument("--freeze_encoder",       default=0,      type=int,
+                    help="If 1, freeze the encoder after loading --encoder_ckpt and skip "
+                         "the encoder optimizer step each epoch. Only the critic trains.")
 args, unknown = parser.parse_known_args()
 print(f"Unknown args: {unknown}")
 
@@ -268,26 +336,46 @@ def get_effective_lambda(epoch):
 
 
 def compute_critic_loss(inputs, labels, nuisances, model, critic_model,
-                        critic_criterion, reweight_args, joint_indep_args, split="train"):
-    activations, _ = model(inputs)
+                        critic_criterion, reweight_args, joint_indep_args, split="train",
+                        ae_reco=None, activations=None):
+    if activations is None:
+        activations, _ = model(inputs)
     y_in = (torch.zeros_like(labels.unsqueeze(1)).float().to(device)
             if joint_indep_args["marginal_indep"]
             else labels.unsqueeze(1).float().to(device))
 
-    if joint_indep_args.get("critic_type") == "density_ratio":
+    critic_type = joint_indep_args.get("critic_type", "bin_pred")
+
+    # resolve critic input: raw latent, scalar MD, or latent+MD
+    if critic_type == "md_bin_pred":
+        qcd_mask = (labels == joint_indep_args.get("qcd_label", 1))
+        critic_input = _proxy_md(activations, qcd_mask)        # [B] scalar
+    elif critic_type == "aug_bin_pred":
+        qcd_mask = (labels == joint_indep_args.get("qcd_label", 1))
+        md = _proxy_md(activations, qcd_mask)                  # [B]
+        critic_input = torch.cat([activations, md.unsqueeze(1)], dim=1)  # [B, latent_dim+1]
+    else:
+        critic_input = activations                             # [B, latent_dim]
+
+    if critic_type == "density_ratio":
         # gabhijith's density-ratio trick: classify real vs shuffled-z
-        pos_out = critic_model(activations, y_in, nuisances)
+        pos_out = critic_model(critic_input, y_in, nuisances)
         pos_losses = critic_criterion(pos_out, torch.ones_like(labels))
         shuffled_z = nuisances[torch.randperm(nuisances.size(0))]
-        neg_out = critic_model(activations, y_in, shuffled_z)
+        neg_out = critic_model(critic_input, y_in, shuffled_z)
         neg_losses = critic_criterion(neg_out, torch.zeros_like(labels))
         outputs = torch.cat([pos_out, neg_out], dim=0)
         targets = torch.cat([torch.ones_like(labels), torch.zeros_like(labels)])
         losses  = torch.cat([pos_losses, neg_losses])
         return outputs, targets, losses
+    elif critic_type == "ae_regress":
+        # regress continuous AE reco score — no bin marginal reweighting needed
+        outputs = critic_model(critic_input, y_in)             # [B]
+        losses  = critic_criterion(outputs, ae_reco.float())   # MSE per sample [B]
+        return outputs, ae_reco, losses
     else:
-        # bin-prediction approach (WHAT WE are doing rn)
-        outputs = critic_model(activations, y_in)
+        # bin_pred or md_bin_pred — same CE + marginal normalization
+        outputs = critic_model(critic_input, y_in)
         losses = critic_criterion(outputs, nuisances.long())
         nuisance_marginals = torch.tensor(
             [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
@@ -304,19 +392,23 @@ def train_critic(critic_model, model, train_loader, critic_criterion, critic_opt
     rw_loss = AverageMeter()
     rw_acc = AverageMeter()
     end = time.time()
-    for inputs, targets, nuisances, _ae_reco in train_loader:
+    for batch in train_loader:
+        inputs, targets, nuisances = batch[0], batch[1], batch[2]
         exact_weights = torch.tensor([
             reweight_args["train_dataset"].weights[(int(y.item()), int(z.item()))]
             for y, z in zip(targets, nuisances)
         ]).to(device)
+        gen_w = batch[4].to(device) if len(batch) == 5 else torch.ones(inputs.size(0), device=device)
         inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
+        gen_w = torch.where(targets == reweight_args["qcd_label"], gen_w, torch.ones_like(gen_w))
         outputs, tgts, losses = compute_critic_loss(
             inputs, targets, nuisances, model, critic_model,
             critic_criterion, reweight_args, joint_indep_args, "train")
-        weights = exact_weights if reweight_args["reweight"] else torch.ones_like(exact_weights)
+        weights = exact_weights * gen_w if reweight_args["reweight"] else gen_w
         tensor_loss = (losses * weights).sum() / weights.sum()
         critic_optimizer.zero_grad()
-        tensor_loss.backward(); critic_optimizer.step()
+        tensor_loss.backward()
+        critic_optimizer.step()
         batch_time.update(time.time() - end); end = time.time()
     log.debug(f"Train Critic Epoch [{epoch}]")
     return critic_model
@@ -327,16 +419,19 @@ def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, lo
     critic_model.eval(); model.eval()
     loss_m = AverageMeter(); rw_acc_m = AverageMeter(); acc_m = AverageMeter()
     with torch.no_grad():
-        for inputs, targets, nuisances, _ae_reco in val_loader:
+        for batch in val_loader:
+            inputs, targets, nuisances = batch[0], batch[1], batch[2]
             exact_weights = torch.tensor([
                 reweight_args["val_dataset"].weights.get((int(y.item()), int(z.item())), 1.0)
                 for y, z in zip(targets, nuisances)
             ]).to(device)
+            gen_w = batch[4].to(device) if len(batch) == 5 else torch.ones(inputs.size(0), device=device)
             inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
+            gen_w = torch.where(targets == reweight_args["qcd_label"], gen_w, torch.ones_like(gen_w))
             outputs, tgts, losses = compute_critic_loss(
                 inputs, targets, nuisances, model, critic_model,
                 critic_criterion, reweight_args, joint_indep_args, "val")
-            weights = exact_weights if reweight_args["reweight"] else torch.ones_like(exact_weights)
+            weights = exact_weights * gen_w if reweight_args["reweight"] else gen_w
             loss_m.update((losses * weights).sum().item() / weights.sum().item(), inputs.size(0))
     return loss_m.avg, acc_m.avg, rw_acc_m.avg
 
@@ -347,7 +442,7 @@ def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, lo
 contrastive_loss_fn = SupConLoss(temperature=args.contrast_temp)
 
 def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
-          reweight_args, joint_indep_args, effective_lambda=None):
+          reweight_args, joint_indep_args, effective_lambda=None, stable_md_transform=None):
     batch_time = AverageMeter()
     acc = AverageMeter()
     loss = AverageMeter()
@@ -366,17 +461,19 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     model.train()
     end = time.time()
     #look up the Nurd weight for every sample
-    for inputs, targets, nuisances, ae_reco in train_loader:
+    for batch in train_loader:
+        inputs, targets, nuisances, ae_reco = batch[0], batch[1], batch[2], batch[3]
         exact_weights = torch.tensor([
             reweight_args["train_dataset"].weights[(int(y.item()), int(z.item()))]
             for y, z in zip(targets, nuisances)
         ]).to(device)
+        gen_w = batch[4].to(device) if len(batch) == 5 else torch.ones(inputs.size(0), device=device)
         inputs = inputs.to(device)
         targets = targets.long().to(device)
         nuisances = nuisances.to(device)
         ae_reco = ae_reco.to(device)
 
-        #critic gets updated first before main model see this batch. 
+        #critic gets updated first before main model see this batch.
         if joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "warmup":
             #take our critic train frac for each batch
             if random.random() < joint_indep_args["critic_train_frac"]:
@@ -384,28 +481,54 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
                 joint_indep_args["critic_model"].train()
                 model.eval()
-                #run main model to get activations 
+                #run main model to get activations
                 with torch.no_grad(): #activations are detached (critic's gradient update can't affect main models weights)
                     act_detached, _ = model(inputs)
                 #critic takes latent representation and class label as input
                 y_in = (torch.zeros_like(targets.unsqueeze(1)).float().to(device)
                         if joint_indep_args["marginal_indep"]
                         else targets.unsqueeze(1).float().to(device))
-                #looks up P(z=k) for each sample (probabliity of that nuisance bin - used to normalize the critic)
-                nu_marg = torch.tensor(
-                    [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
-                ).to(device)
-                # multiple steps on the same batch to help critic converge faster
-                # critic is trained unweighted so it sees the natural latent-z correlation
                 n_steps = joint_indep_args.get("n_critic_steps_per_batch", 1)
-                for _ in range(n_steps): #in this case we are oding 3 steps
-                    c_out = joint_indep_args["critic_model"](act_detached, y_in)
-                    c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
-                    c_losses = torch.div(c_losses, nu_marg + 1e-8)
-                    c_loss = c_losses.mean()
-                    joint_indep_args["critic_optimizer"].zero_grad()
-                    c_loss.backward()
-                    joint_indep_args["critic_optimizer"].step()
+                # resolve critic input once before the inner loop
+                _ct = joint_indep_args.get("critic_type")
+                if _ct == "md_bin_pred":
+                    _qcd_mask = (targets == joint_indep_args.get("qcd_label", 1))
+                    critic_input = _proxy_md(act_detached, _qcd_mask)
+                elif _ct == "aug_bin_pred":
+                    _qcd_mask = (targets == joint_indep_args.get("qcd_label", 1))
+                    _md = _proxy_md(act_detached, _qcd_mask)
+                    critic_input = torch.cat([act_detached, _md.unsqueeze(1)], dim=1)
+                else:
+                    critic_input = act_detached
+                if joint_indep_args.get("critic_type") == "ae_regress":
+                    for _ in range(n_steps):
+                        c_out    = joint_indep_args["critic_model"](critic_input, y_in)
+                        c_losses = joint_indep_args["critic_criterion"](c_out, ae_reco.float())
+                        joint_indep_args["critic_optimizer"].zero_grad()
+                        c_losses.mean().backward()
+                        joint_indep_args["critic_optimizer"].step()
+                elif joint_indep_args.get("critic_type") == "density_ratio":
+                    for _ in range(n_steps):
+                        pos_out    = joint_indep_args["critic_model"](critic_input, y_in, nuisances)
+                        pos_losses = joint_indep_args["critic_criterion"](pos_out, torch.ones_like(targets))
+                        shuf_z     = nuisances[torch.randperm(nuisances.size(0))]
+                        neg_out    = joint_indep_args["critic_model"](critic_input, y_in, shuf_z)
+                        neg_losses = joint_indep_args["critic_criterion"](neg_out, torch.zeros_like(targets))
+                        c_losses   = torch.cat([pos_losses, neg_losses])
+                        joint_indep_args["critic_optimizer"].zero_grad()
+                        c_losses.mean().backward()
+                        joint_indep_args["critic_optimizer"].step()
+                else:
+                    nu_marg = torch.tensor(
+                        [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
+                    ).to(device)
+                    for _ in range(n_steps):
+                        c_out    = joint_indep_args["critic_model"](critic_input, y_in)
+                        c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
+                        c_losses = torch.div(c_losses, nu_marg + 1e-8)
+                        joint_indep_args["critic_optimizer"].zero_grad()
+                        c_losses.mean().backward()
+                        joint_indep_args["critic_optimizer"].step()
                 #refreeze critic and put main model in train mode again
                 joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
                 model.train()
@@ -472,11 +595,11 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         # ── NURD joint independence penalty ───────────────────────────────────
         info_loss_val = 0.0 #normalized MI penalty
         raw_mi_val = 0.0 #raw MI penalty
-     
+
         if joint_indep_args["joint_indep"]:
             #use ramped lambda during warmup, else fix lambda
             lam = effective_lambda if effective_lambda is not None else joint_indep_args["lambda"]
-            
+
             with (torch.no_grad() if lam == 0.0 else torch.enable_grad()):
                 # run frozen critic on current activations → per-sample losses [B]
                 # low loss = critic can predict nuisance bin = encoder is leaking nuisance info
@@ -484,7 +607,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 _, _, info_losses = compute_critic_loss(
                     inputs, targets, nuisances, model,
                     joint_indep_args["critic_model"], joint_indep_args["critic_criterion"],
-                    reweight_args, joint_indep_args, "train")
+                    reweight_args, joint_indep_args, "train", ae_reco=ae_reco,
+                    activations=activations)
             #not doing this right now
             if joint_indep_args.get("critic_type") == "density_ratio":
                 half = len(info_losses) // 2
@@ -498,38 +622,61 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 if lam > 0.0:
                     if not args.no_mi_norm:
                         info_losses = info_losses / (info_losses.detach().mean() + 1e-8)
-                    # subtract because high critic loss = encoder already independent = good
-                    # gradient rewards encoder for confusing the critic
-                    losses_ce = losses_ce - lam * info_losses
                     info_loss_val = info_losses.mean().item()
 
-        #nurd reweighting
-        weights = exact_weights.to(device) if reweight_args["reweight"] else torch.ones_like(exact_weights).to(device)
+        # gen weights correct QCD MC normalisation only — mask to 1.0 for non-QCD
+        # so signal events are never upweighted by physics correction factors
+        gen_w_qcd = torch.where(targets == args.qcd_label, gen_w, torch.ones_like(gen_w))
+
+        #nurd reweighting × gen weights (base CE only; MI penalty added separately below
+        # to prevent extreme gen weights from amplifying the unbounded negative MI term)
+        weights = exact_weights.to(device) * gen_w_qcd if reweight_args["reweight"] else gen_w_qcd
         rw_acc, rw_loss = record_rw_metrics(rw_acc, rw_loss, inputs, outputs, targets, losses_ce, weights)
-        loss_nurd = (losses_ce * weights).sum() / weights.sum()
+        loss_nurd_ce = (losses_ce * weights).sum() / weights.sum()
+        # MI term: weighted by NURD weights only (bounded, not by gen weights)
+        if joint_indep_args["joint_indep"] and lam > 0.0:
+            nurd_w = exact_weights.to(device)
+            loss_nurd = loss_nurd_ce - lam * (info_losses * nurd_w).sum() / nurd_w.sum()
+        else:
+            loss_nurd = loss_nurd_ce
 
         #contrastive loss
         embeddings  = model.get_embeddings(activations)
-        loss_con = contrastive_loss_fn(embeddings, targets)
+        loss_con = contrastive_loss_fn(embeddings, targets, weights=gen_w_qcd)
         tensor_loss = (1 - args.contrast_weight) * loss_nurd + args.contrast_weight * loss_con
 
-        #ABCD closure loss (batch level MD)
+        #ABCD closure loss
         loss_closure = torch.tensor(0.0, device=device)
         if args.closure_weight > 0.0:
             qcd_mask = targets == args.qcd_label
             if qcd_mask.sum() > 10:
-                proxy_md = _proxy_md(activations, qcd_mask)
+                if args.closure_on_logits:
+                    # axis2 = 1 - P(QCD): directly differentiable, no proxy needed
+                    probs = F.softmax(outputs, dim=1)
+                    axis2_all = 1.0 - probs[:, args.qcd_label]
+                elif stable_md_transform is not None:
+                    # axis2 = MD using epoch-level stable covariance fit
+                    mu_s, W_s = stable_md_transform
+                    z = (activations.float() - mu_s) @ W_s
+                    axis2_all = (z * z).sum(dim=1).to(activations.dtype)
+                else:
+                    # axis2 = batch-level proxy MD (noisy but no extra pass)
+                    axis2_all = _proxy_md(activations, qcd_mask)
                 nw = torch.ones(qcd_mask.sum(), device=device)
                 loss_closure = closure_loss_batch(
                     ae_reco[qcd_mask].float(),
-                    proxy_md[qcd_mask].float(),
+                    axis2_all[qcd_mask].float(),
                     nw,
+                    n_cuts=args.closure_n_cuts,
+                    scale=args.closure_sigmoid_scale,
+                    cut_min=args.closure_cut_min,
                 )
                 tensor_loss = tensor_loss + args.closure_weight * loss_closure
 
-        optimizer.zero_grad()
-        tensor_loss.backward()
-        optimizer.step()
+        if tensor_loss.requires_grad:
+            optimizer.zero_grad()
+            tensor_loss.backward()
+            optimizer.step()
 
         bs = inputs.size(0)
         batch_time.update(time.time() - end); end = time.time()
@@ -579,11 +726,13 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args):
     model.eval()
     with torch.no_grad():
         end = time.time()
-        for inputs, targets, nuisances, _ae_reco in val_loader:
+        for batch in val_loader:
+            inputs, targets, nuisances = batch[0], batch[1], batch[2]
             exact_weights = torch.tensor([
                 reweight_args["val_dataset"].weights.get((int(y.item()), int(z.item())), 1.0)
                 for y, z in zip(targets, nuisances)
             ]).to(device)
+            gen_w = batch[4].to(device) if len(batch) == 5 else torch.ones(inputs.size(0), device=device)
             inputs    = inputs.to(device)
             targets   = targets.long().to(device)
             _, outputs = model(inputs)
@@ -593,7 +742,7 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args):
             if reweight_args["reweight"]:
                 rw_acc, rw_loss = record_rw_metrics(
                     rw_acc, rw_loss, inputs, outputs, targets, losses,
-                    exact_weights.to(device))
+                    exact_weights.to(device) * gen_w)
             batch_time.update(time.time() - end); end = time.time()
 
     log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss, rw_acc, split="Val")
@@ -631,7 +780,7 @@ def main():
         "decoder_config": {"nodes": [256,512, None]},
         "alpha": 1.0
     })
-    
+
     if ae_cfg["features"] is None:
         first_w = ae_ckpt["ae"][next(iter(ae_ckpt["ae"]))]
         ae_cfg["features"] = first_w.shape[1]
@@ -646,7 +795,11 @@ def main():
     log.debug("Loading data and computing nuisance bins (AE reco)...")
     train_dataset, val_dataset, obj_scaler = build_hlt_datasets(
         args.data, ae, n_bins=args.n_bins,
-        val_split=args.val_split, max_events=args.max_events
+        val_split=args.val_split, max_events=args.max_events,
+        exclude_labels=args.exclude_labels,
+        gen_weight_path=args.gen_weight_path,
+        gen_weight_clip=args.gen_weight_clip,
+        qcd_label=args.qcd_label,
     )
     log.debug(f"Train: {len(train_dataset)}  Val: {len(val_dataset)}")
 
@@ -674,6 +827,14 @@ def main():
         num_tokens=num_tokens,
     ).to(device)
 
+    if args.encoder_ckpt:
+        enc_ckpt = torch.load(args.encoder_ckpt, map_location=device)
+        model.load_state_dict(enc_ckpt["state_dict_model"])
+        log.debug(f"Loaded encoder weights from {args.encoder_ckpt}")
+    if args.freeze_encoder:
+        freeze_model(model)
+        log.debug("Encoder frozen — only critic will train")
+
     criterion = nn.CrossEntropyLoss(reduction="none").to(device)
     if args.optimizer == "adam":
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -682,14 +843,21 @@ def main():
                                     weight_decay=args.weight_decay, momentum=args.momentum)
 
     #load critic model
+    if args.critic_on_md:
+        effective_critic_type = "md_bin_pred"
+    elif args.critic_aug_md:
+        effective_critic_type = "aug_bin_pred"
+    else:
+        effective_critic_type = args.critic_type
     critic_model = HLTCritic(args.latent_dim, num_classes, args.n_bins,
-                             critic_type=args.critic_type).to(device) if args.joint_indep else None
+                             critic_type=effective_critic_type).to(device) if args.joint_indep else None
 
     reweight_args = {
         "reweight":      args.reweight,
         "label_prior":   label_prior,
         "train_dataset": train_dataset,
         "val_dataset":   val_dataset,
+        "qcd_label":     args.qcd_label,
     }
     joint_indep_args = {
         "joint_indep":      args.joint_indep,
@@ -700,9 +868,11 @@ def main():
         "marginal_indep":   args.marginal_indep,
         "lambda":           args._lambda,
         "nuisance_prior":   nuisance_prior,
-        "critic_criterion": nn.CrossEntropyLoss(reduction="none").to(device),
+        "critic_criterion": (nn.MSELoss(reduction="none") if args.critic_type == "ae_regress"
+                             else nn.CrossEntropyLoss(reduction="none")).to(device),
         "critic_schedule":  args.critic_schedule,
-        "critic_type":      args.critic_type,
+        "critic_type":      effective_critic_type,
+        "qcd_label":        args.qcd_label,
         "critic_train_frac": args.critic_train_frac,
         "critic_optimizer": (torch.optim.Adam(critic_model.parameters(),
                                               lr=args.lr * args.critic_lr_multiplier,
@@ -750,9 +920,17 @@ def main():
         #ramp lambda
         effective_lambda = get_effective_lambda(epoch) if args.critic_schedule == "warmup" else None
 
+        # stable MD transform: fit once per epoch on full training set (only when needed)
+        stable_md_transform = None
+        if args.stable_closure_md and args.closure_weight > 0.0 and not args.closure_on_logits:
+            stable_md_transform = compute_stable_md_transform(
+                model, train_loader, device, args.qcd_label)
+            torch.cuda.empty_cache()
+
         #all the critic logic here (loss computation, weight updates)
         train(model, train_loader, val_loader, criterion, optimizer,
-              epoch + args.reweight_epochs, log, reweight_args, joint_indep_args, effective_lambda)
+              epoch + args.reweight_epochs, log, reweight_args, joint_indep_args, effective_lambda,
+              stable_md_transform=stable_md_transform)
         #runs model on validation set with no gradient updates (just forward passes)
         val_loss, val_acc, val_rw_acc = validate(
             val_loader, model, criterion, epoch + args.reweight_epochs, log, reweight_args)
