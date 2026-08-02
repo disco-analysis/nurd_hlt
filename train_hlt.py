@@ -276,19 +276,19 @@ def compute_critic_loss(inputs, labels, nuisances, model, critic_model,
 
     if joint_indep_args.get("critic_type") == "density_ratio":
         # gabhijith's density-ratio trick: classify real vs shuffled-z
-        pos_out    = critic_model(activations, y_in, nuisances)
+        pos_out = critic_model(activations, y_in, nuisances)
         pos_losses = critic_criterion(pos_out, torch.ones_like(labels))
         shuffled_z = nuisances[torch.randperm(nuisances.size(0))]
-        neg_out    = critic_model(activations, y_in, shuffled_z)
+        neg_out = critic_model(activations, y_in, shuffled_z)
         neg_losses = critic_criterion(neg_out, torch.zeros_like(labels))
         outputs = torch.cat([pos_out, neg_out], dim=0)
         targets = torch.cat([torch.ones_like(labels), torch.zeros_like(labels)])
         losses  = torch.cat([pos_losses, neg_losses])
         return outputs, targets, losses
     else:
-        # bin-prediction approach
+        # bin-prediction approach (WHAT WE are doing rn)
         outputs = critic_model(activations, y_in)
-        losses  = critic_criterion(outputs, nuisances.long())
+        losses = critic_criterion(outputs, nuisances.long())
         nuisance_marginals = torch.tensor(
             [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
         ).to(device)
@@ -298,9 +298,11 @@ def compute_critic_loss(inputs, labels, nuisances, model, critic_model,
 
 def train_critic(critic_model, model, train_loader, critic_criterion, critic_optimizer,
                  epoch, log, reweight_args, joint_indep_args):
-    critic_model.train(); model.eval()
+    critic_model.train()
+    model.eval()
     batch_time = AverageMeter()
-    rw_loss = AverageMeter(); rw_acc = AverageMeter()
+    rw_loss = AverageMeter()
+    rw_acc = AverageMeter()
     end = time.time()
     for inputs, targets, nuisances, _ae_reco in train_loader:
         exact_weights = torch.tensor([
@@ -313,7 +315,8 @@ def train_critic(critic_model, model, train_loader, critic_criterion, critic_opt
             critic_criterion, reweight_args, joint_indep_args, "train")
         weights = exact_weights if reweight_args["reweight"] else torch.ones_like(exact_weights)
         tensor_loss = (losses * weights).sum() / weights.sum()
-        critic_optimizer.zero_grad(); tensor_loss.backward(); critic_optimizer.step()
+        critic_optimizer.zero_grad()
+        tensor_loss.backward(); critic_optimizer.step()
         batch_time.update(time.time() - end); end = time.time()
     log.debug(f"Train Critic Epoch [{epoch}]")
     return critic_model
@@ -338,159 +341,179 @@ def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, lo
     return loss_m.avg, acc_m.avg, rw_acc_m.avg
 
 
-# ── Main training function ────────────────────────────────────────────────────
+#training functions
 
+#get contrastive loss
 contrastive_loss_fn = SupConLoss(temperature=args.contrast_temp)
 
 def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
           reweight_args, joint_indep_args, effective_lambda=None):
     batch_time = AverageMeter()
-    acc = AverageMeter(); loss = AverageMeter(); top1 = AverageMeter()
-    rw_acc = AverageMeter(); rw_loss = AverageMeter()
-    # extra meters for losses we want to track individually
-    total_m   = AverageMeter()   # total loss
-    nurd_m    = AverageMeter()   # NURD-weighted CE
-    con_m     = AverageMeter()   # contrastive
+    acc = AverageMeter()
+    loss = AverageMeter()
+    top1 = AverageMeter()
+    rw_acc = AverageMeter()
+    rw_loss = AverageMeter()
+    total_m = AverageMeter()   # total loss
+    nurd_m = AverageMeter()   # NURD-weighted CE
+    con_m = AverageMeter()   # contrastive
     closure_m  = AverageMeter()   # ABCD closure
-    mi_m       = AverageMeter()   # MI / independence penalty (normalized, always ~1)
-    raw_mi_m   = AverageMeter()   # raw critic CE before normalization
+    mi_m  = AverageMeter()   # MI / independence penalty (normalized, always ~1)
+    raw_mi_m  = AverageMeter()   # raw critic CE before normalization
     weight_cv_m = AverageMeter()  # coeff. of variation of NURD weights (std/mean); 0 = uniform, >1 = heavy tails
     weight_ess_m = AverageMeter() # effective sample size fraction: ESS/N; 1.0 = no reweighting cost
 
     model.train()
     end = time.time()
+    #look up the Nurd weight for every sample
     for inputs, targets, nuisances, ae_reco in train_loader:
         exact_weights = torch.tensor([
             reweight_args["train_dataset"].weights[(int(y.item()), int(z.item()))]
             for y, z in zip(targets, nuisances)
         ]).to(device)
-        inputs    = inputs.to(device)
-        targets   = targets.long().to(device)
+        inputs = inputs.to(device)
+        targets = targets.long().to(device)
         nuisances = nuisances.to(device)
-        ae_reco   = ae_reco.to(device)
+        ae_reco = ae_reco.to(device)
 
-        # ── joint independence: warmup schedule — interleaved critic on critic_train_frac of batches ─
+        #critic gets updated first before main model see this batch. 
         if joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "warmup":
+            #take our critic train frac for each batch
             if random.random() < joint_indep_args["critic_train_frac"]:
+                #critic unfreezes and goes into train mode (eval main model)
                 joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
                 joint_indep_args["critic_model"].train()
                 model.eval()
-                with torch.no_grad():
+                #run main model to get activations 
+                with torch.no_grad(): #activations are detached (critic's gradient update can't affect main models weights)
                     act_detached, _ = model(inputs)
+                #critic takes latent representation and class label as input
                 y_in = (torch.zeros_like(targets.unsqueeze(1)).float().to(device)
                         if joint_indep_args["marginal_indep"]
                         else targets.unsqueeze(1).float().to(device))
+                #looks up P(z=k) for each sample (probabliity of that nuisance bin - used to normalize the critic)
                 nu_marg = torch.tensor(
                     [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
                 ).to(device)
-                # multiple steps on the same batch to help critic converge faster;
+                # multiple steps on the same batch to help critic converge faster
                 # critic is trained unweighted so it sees the natural latent-z correlation
                 n_steps = joint_indep_args.get("n_critic_steps_per_batch", 1)
-                for _ in range(n_steps):
-                    c_out    = joint_indep_args["critic_model"](act_detached, y_in)
+                for _ in range(n_steps): #in this case we are oding 3 steps
+                    c_out = joint_indep_args["critic_model"](act_detached, y_in)
                     c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
                     c_losses = torch.div(c_losses, nu_marg + 1e-8)
-                    c_loss   = c_losses.mean()
+                    c_loss = c_losses.mean()
                     joint_indep_args["critic_optimizer"].zero_grad()
                     c_loss.backward()
                     joint_indep_args["critic_optimizer"].step()
+                #refreeze critic and put main model in train mode again
                 joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
                 model.train()
 
         # ── joint independence: one critic gradient step on this batch (interleaved) ─
-        elif joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "interleaved":
-            joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
-            joint_indep_args["critic_model"].train()
-            model.eval()
-            with torch.no_grad():
-                act_detached, _ = model(inputs)
-            y_in = (torch.zeros_like(targets.unsqueeze(1)).float().to(device)
-                    if joint_indep_args["marginal_indep"]
-                    else targets.unsqueeze(1).float().to(device))
-            c_out    = joint_indep_args["critic_model"](act_detached, y_in)
-            c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
-            nu_marg  = torch.tensor(
-                [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
-            ).to(device)
-            c_losses = torch.div(c_losses, nu_marg + 1e-8)
-            w = exact_weights if reweight_args["reweight"] else torch.ones_like(exact_weights)
-            c_loss = (c_losses * w).sum() / w.sum()
-            joint_indep_args["critic_optimizer"].zero_grad()
-            c_loss.backward()
-            joint_indep_args["critic_optimizer"].step()
-            joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
-            model.train()
+        # elif joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "interleaved":
+        #     joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
+        #     joint_indep_args["critic_model"].train()
+        #     model.eval()
+        #     with torch.no_grad():
+        #         act_detached, _ = model(inputs)
+        #     y_in = (torch.zeros_like(targets.unsqueeze(1)).float().to(device)
+        #             if joint_indep_args["marginal_indep"]
+        #             else targets.unsqueeze(1).float().to(device))
+        #     c_out    = joint_indep_args["critic_model"](act_detached, y_in)
+        #     c_losses = joint_indep_args["critic_criterion"](c_out, nuisances.long())
+        #     nu_marg  = torch.tensor(
+        #         [joint_indep_args["nuisance_prior"][int(z.item())] for z in nuisances]
+        #     ).to(device)
+        #     c_losses = torch.div(c_losses, nu_marg + 1e-8)
+        #     w = exact_weights if reweight_args["reweight"] else torch.ones_like(exact_weights)
+        #     c_loss = (c_losses * w).sum() / w.sum()
+        #     joint_indep_args["critic_optimizer"].zero_grad()
+        #     c_loss.backward()
+        #     joint_indep_args["critic_optimizer"].step()
+        #     joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
+        #     model.train()
 
         # ── joint independence: train critic inner loop (per_batch schedule) ───
-        elif joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "per_batch":
-            best_loss = None
-            joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
-            model = freeze_model(model)
-            critic_optimizer = torch.optim.Adam(
-                joint_indep_args["critic_model"].parameters(),
-                lr=joint_indep_args["lr"], weight_decay=joint_indep_args["weight_decay"])
-            for ce in range(joint_indep_args["critic_epochs"]):
-                joint_indep_args["critic_model"] = train_critic(
-                    joint_indep_args["critic_model"], model, train_loader,
-                    joint_indep_args["critic_criterion"], critic_optimizer, ce, log,
-                    reweight_args, joint_indep_args)
-                c_loss, c_acc, c_rw_acc = validate_critic(
-                    val_loader, joint_indep_args["critic_model"], model,
-                    joint_indep_args["critic_criterion"], ce, log,
-                    reweight_args, joint_indep_args)
-                if best_loss is None or c_loss < best_loss:
-                    best_loss = c_loss
-                    save_checkpoint(args, {
-                        "epoch": ce+1,
-                        "state_dict_model": joint_indep_args["critic_model"].state_dict()
-                    }, ce+1, name="critic")
-            ckpt_file = f"checkpoints/hlt/{args.project_name}/{args.exp_name}/checkpoint_critic.pth.tar"
-            joint_indep_args["critic_model"].load_state_dict(
-                torch.load(ckpt_file)["state_dict_model"])
-            joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
-            model = unfreeze_model(model)
+        # elif joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "per_batch":
+        #     best_loss = None
+        #     joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
+        #     model = freeze_model(model)
+        #     critic_optimizer = torch.optim.Adam(
+        #         joint_indep_args["critic_model"].parameters(),
+        #         lr=joint_indep_args["lr"], weight_decay=joint_indep_args["weight_decay"])
+        #     for ce in range(joint_indep_args["critic_epochs"]):
+        #         joint_indep_args["critic_model"] = train_critic(
+        #             joint_indep_args["critic_model"], model, train_loader,
+        #             joint_indep_args["critic_criterion"], critic_optimizer, ce, log,
+        #             reweight_args, joint_indep_args)
+        #         c_loss, c_acc, c_rw_acc = validate_critic(
+        #             val_loader, joint_indep_args["critic_model"], model,
+        #             joint_indep_args["critic_criterion"], ce, log,
+        #             reweight_args, joint_indep_args)
+        #         if best_loss is None or c_loss < best_loss:
+        #             best_loss = c_loss
+        #             save_checkpoint(args, {
+        #                 "epoch": ce+1,
+        #                 "state_dict_model": joint_indep_args["critic_model"].state_dict()
+        #             }, ce+1, name="critic")
+        #     ckpt_file = f"checkpoints/hlt/{args.project_name}/{args.exp_name}/checkpoint_critic.pth.tar"
+        #     joint_indep_args["critic_model"].load_state_dict(
+        #         torch.load(ckpt_file)["state_dict_model"])
+        #     joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
+        #     model = unfreeze_model(model)
 
-        # ── forward pass ──────────────────────────────────────────────────────
+        #forward pass
         activations, outputs = model(inputs)
         losses_ce = criterion(outputs, targets)         # [B] CE loss
 
         acc, loss, top1 = record_metrics(acc, loss, top1, inputs, outputs, targets, losses_ce)
 
         # ── NURD joint independence penalty ───────────────────────────────────
-        info_loss_val = 0.0
-        raw_mi_val = 0.0
+        info_loss_val = 0.0 #normalized MI penalty
+        raw_mi_val = 0.0 #raw MI penalty
+     
         if joint_indep_args["joint_indep"]:
+            #use ramped lambda during warmup, else fix lambda
             lam = effective_lambda if effective_lambda is not None else joint_indep_args["lambda"]
+            
             with (torch.no_grad() if lam == 0.0 else torch.enable_grad()):
+                # run frozen critic on current activations → per-sample losses [B]
+                # low loss = critic can predict nuisance bin = encoder is leaking nuisance info
+                # high loss = critic can't predict nuisance bin = encoder is already independent
                 _, _, info_losses = compute_critic_loss(
                     inputs, targets, nuisances, model,
                     joint_indep_args["critic_model"], joint_indep_args["critic_criterion"],
                     reweight_args, joint_indep_args, "train")
+            #not doing this right now
             if joint_indep_args.get("critic_type") == "density_ratio":
                 half = len(info_losses) // 2
                 penalty = info_losses[half:] - info_losses[:half]
                 raw_mi_val = penalty.mean().item()
                 if lam > 0.0:
                     losses_ce = losses_ce + lam * penalty
+            #bin pred critic
             else:
                 raw_mi_val = info_losses.mean().item()
                 if lam > 0.0:
                     if not args.no_mi_norm:
                         info_losses = info_losses / (info_losses.detach().mean() + 1e-8)
+                    # subtract because high critic loss = encoder already independent = good
+                    # gradient rewards encoder for confusing the critic
                     losses_ce = losses_ce - lam * info_losses
                     info_loss_val = info_losses.mean().item()
 
-        # ── NURD exact reweighting ────────────────────────────────────────────
+        #nurd reweighting
         weights = exact_weights.to(device) if reweight_args["reweight"] else torch.ones_like(exact_weights).to(device)
         rw_acc, rw_loss = record_rw_metrics(rw_acc, rw_loss, inputs, outputs, targets, losses_ce, weights)
         loss_nurd = (losses_ce * weights).sum() / weights.sum()
 
-        # ── Contrastive loss (on top of NURD weighted CE) ─────────────────────
+        #contrastive loss
         embeddings  = model.get_embeddings(activations)
-        loss_con    = contrastive_loss_fn(embeddings, targets)
+        loss_con = contrastive_loss_fn(embeddings, targets)
         tensor_loss = (1 - args.contrast_weight) * loss_nurd + args.contrast_weight * loss_con
 
-        # ── ABCD closure loss (optional, batch-level MD) ───────────────────────
+        #ABCD closure loss (batch level MD)
         loss_closure = torch.tensor(0.0, device=device)
         if args.closure_weight > 0.0:
             qcd_mask = targets == args.qcd_label
@@ -512,7 +535,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         batch_time.update(time.time() - end); end = time.time()
         w_mean = weights.mean()
         w_std  = weights.std()
-        ess    = (w_mean ** 2 / (weights ** 2).mean()).item()   # ESS / batch_size
+        ess = (w_mean ** 2 / (weights ** 2).mean()).item()   # ESS / batch_size
         total_m.update(tensor_loss.item(),      bs)
         nurd_m.update(loss_nurd.item(),         bs)
         con_m.update(loss_con.item(),           bs)
@@ -522,6 +545,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         weight_cv_m.update((w_std / (w_mean + 1e-8)).item(), bs)
         weight_ess_m.update(ess,                bs)
 
+    #logging
     log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss, rw_acc, split="Train")
     current_lr = optimizer.param_groups[0]["lr"]
     log.debug(f"  total={total_m.avg:.5f}  nurd={nurd_m.avg:.5f}  "
@@ -588,6 +612,7 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    #logging
     log = logging.getLogger(__name__)
     log.setLevel(logging.DEBUG)
     fh = logging.FileHandler(os.path.join(directory, args.log_name), mode="w")
@@ -598,7 +623,7 @@ def main():
 
     args.in_dataset = "hlt"   # required by save_checkpoint path construction
 
-    # ── Load pre-trained AE ────────────────────────────────────────────────
+    #load the frozen AE (pretrained)
     ae_ckpt = torch.load(args.ae_ckpt, map_location=device)
     ae_cfg  = ae_ckpt.get("ae_config", {
         "features": None, "latent_dim": 16,
@@ -606,7 +631,7 @@ def main():
         "decoder_config": {"nodes": [256,512, None]},
         "alpha": 1.0
     })
-    # if config didn't store features, infer from state dict
+    
     if ae_cfg["features"] is None:
         first_w = ae_ckpt["ae"][next(iter(ae_ckpt["ae"]))]
         ae_cfg["features"] = first_w.shape[1]
@@ -617,7 +642,7 @@ def main():
     for p in ae.parameters(): p.requires_grad_(False)
     log.debug(f"Loaded frozen AE from {args.ae_ckpt}")
 
-    # ── Build datasets ─────────────────────────────────────────────────────
+    #loads data and also AE reco losses to then bin into nuisance categories inside dataset builder (norm saved for inference)
     log.debug("Loading data and computing nuisance bins (AE reco)...")
     train_dataset, val_dataset, obj_scaler = build_hlt_datasets(
         args.data, ae, n_bins=args.n_bins,
@@ -632,10 +657,11 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,  **kwargs)
     val_loader   = DataLoader(val_dataset,   batch_size=args.batch_size, shuffle=False, **kwargs)
 
+    #nuisance prior is marginal probability of each bin (used to normalize critic loss)
     label_prior    = train_dataset.get_label_prior()
     nuisance_prior = train_dataset.get_nuisance_prior() if args.joint_indep else None
 
-    # ── Build model ────────────────────────────────────────────────────────
+    # load HLT model
     model = HLTContrastiveModel(
         num_classes=num_classes,
         embed_size=args.embed_size,
@@ -655,6 +681,7 @@ def main():
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr,
                                     weight_decay=args.weight_decay, momentum=args.momentum)
 
+    #load critic model
     critic_model = HLTCritic(args.latent_dim, num_classes, args.n_bins,
                              critic_type=args.critic_type).to(device) if args.joint_indep else None
 
@@ -691,7 +718,7 @@ def main():
         log.debug(f"Epoch {epoch}")
         adjust_learning_rate(optimizer, epoch)
 
-        # ── per-epoch critic schedule: train critic once before main loop ─────
+        #per epoch (train critic once per epoch) THIS IS NOT USED rn (Skipped)
         if args.joint_indep and args.critic_schedule == "per_epoch":
             joint_indep_args["critic_model"] = unfreeze_model(joint_indep_args["critic_model"])
             model = freeze_model(model)
@@ -720,9 +747,13 @@ def main():
             joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
             model = unfreeze_model(model)
 
+        #ramp lambda
         effective_lambda = get_effective_lambda(epoch) if args.critic_schedule == "warmup" else None
+
+        #all the critic logic here (loss computation, weight updates)
         train(model, train_loader, val_loader, criterion, optimizer,
               epoch + args.reweight_epochs, log, reweight_args, joint_indep_args, effective_lambda)
+        #runs model on validation set with no gradient updates (just forward passes)
         val_loss, val_acc, val_rw_acc = validate(
             val_loader, model, criterion, epoch + args.reweight_epochs, log, reweight_args)
 
